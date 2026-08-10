@@ -5,10 +5,13 @@ import { resolve } from 'node:path'
 import { defineComponent } from 'vue'
 import { mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
+import { invoke } from '@tauri-apps/api/core'
+import App from '../src/App.vue'
 import MediaLightbox from '../src/components/MediaLightbox.vue'
 import ReaderSearch from '../src/components/ReaderSearch.vue'
 import ReaderSettings from '../src/components/ReaderSettings.vue'
 import ReadingMode from '../src/components/ReadingMode.vue'
+import DocumentProcessingNotice from '../src/components/DocumentProcessingNotice.vue'
 import TabBar, { type Tab } from '../src/components/TabBar.vue'
 import { useLocale } from '../src/composables/useLocale'
 import { useTheme } from '../src/composables/useTheme'
@@ -38,25 +41,223 @@ function makeTab(id: string, fileName: string): Tab {
 }
 
 describe('reader controls', () => {
-  it('keeps search outside reading settings and closes settings from its backdrop', async () => {
+  it('keeps settings reachable from the empty state and reserves the right side for app actions', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+
+    const settingsToggle = wrapper.get('.titlebar-right .reader-settings-toggle')
+    expect(settingsToggle.attributes('aria-label')).toBe('阅读设置')
+    expect(settingsToggle.attributes('aria-expanded')).toBe('false')
+
+    await settingsToggle.trigger('click')
+    expect(settingsToggle.attributes('aria-expanded')).toBe('true')
+    expect(wrapper.get('[data-reader-settings-backdrop]').exists()).toBe(true)
+    expect(wrapper.get('.reader-settings').exists()).toBe(true)
+
+    await wrapper.get('.reader-settings-close').trigger('click')
+    expect(wrapper.find('[data-reader-settings-backdrop]').exists()).toBe(false)
+
+    const appSource = readFileSync(resolve(process.cwd(), 'src/App.vue'), 'utf8')
+    expect(appSource).toContain('margin-left: auto')
+    wrapper.unmount()
+  })
+
+  it('shows a non-blocking truthful import or render phase without a fake percentage', () => {
+    const wrapper = mount(DocumentProcessingNotice, {
+      props: { fileName: '计划.md', phase: 'importing', message: '正在导入' },
+    })
+
+    expect(wrapper.get('[role="status"]').text()).toContain('计划.md')
+    expect(wrapper.get('[role="status"]').text()).toContain('正在导入')
+    expect(wrapper.text()).not.toMatch(/\d+%/)
+    wrapper.unmount()
+  })
+
+  it('makes the reading UI ready before hydrating deferred resources', async () => {
+    const animationFrames: FrameRequestCallback[] = []
+    const originalRequestAnimationFrame = window.requestAnimationFrame
+    window.requestAnimationFrame = ((callback: FrameRequestCallback) => {
+      animationFrames.push(callback)
+      return animationFrames.length
+    }) as typeof window.requestAnimationFrame
     const wrapper = mount(ReadingMode, {
       attachTo: document.body,
       props: {
         document: {
-          html: '<h1 id="heading">Heading</h1>',
-          outline: [{ id: 'heading', text: 'Heading', level: 1 }],
-          resources: [], links: [], diagrams: [], diagnostics: [],
-          stats: { inputBytes: 1, astNodes: 1, headingCount: 1, diagramCount: 0 },
+          html: '<h1 id="painted">Painted</h1><span data-md-resource-id="resource-paint"></span>',
+          outline: [{ id: 'painted', text: 'Painted', level: 1 }],
+          resources: [{ id: 'resource-paint', kind: 'data', source: 'data:image/png;base64,AA==', alt: '' }],
+          links: [], diagrams: [], diagnostics: [],
+          stats: { inputBytes: 1, astNodes: 2, headingCount: 1, diagramCount: 0 },
         },
-        title: 'document.md', documentId: 'document-1', active: true,
-        initialScrollRatio: 0, remoteImageAuthorized: false, settingsOpen: true,
+        title: 'paint.md', documentId: 'document-paint', active: true,
+        initialScrollRatio: 0, remoteImageAuthorized: false,
+        renderGeneration: 9, paintOperationId: 'operation-paint',
+      },
+    })
+    vi.mocked(invoke).mockImplementation(async () => ({ url: 'data:image/png;base64,AA==' }))
+
+    await wrapper.vm.$nextTick()
+    expect(invoke).not.toHaveBeenCalled()
+    animationFrames.splice(0).forEach((callback) => callback(performance.now()))
+    await Promise.resolve()
+    expect(invoke).not.toHaveBeenCalled()
+    animationFrames.splice(0).forEach((callback) => callback(performance.now()))
+    await Promise.resolve()
+    await wrapper.vm.$nextTick()
+    expect(wrapper.emitted('content-painted')).toEqual([['operation-paint', 'document-paint', 9]])
+    expect(wrapper.find('.catalog-sidebar').exists()).toBe(true)
+    expect(invoke).not.toHaveBeenCalled()
+    animationFrames.splice(0).forEach((callback) => callback(performance.now()))
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1))
+
+    wrapper.unmount()
+    window.requestAnimationFrame = originalRequestAnimationFrame
+    vi.mocked(invoke).mockImplementation(async () => ({ url: 'data:image/png;base64,AA==' }))
+  })
+
+  it('defers offscreen image preparation until the placeholder approaches the reading viewport', async () => {
+    const animationFrames: FrameRequestCallback[] = []
+    const originalRequestAnimationFrame = window.requestAnimationFrame
+    const originalIntersectionObserver = globalThis.IntersectionObserver
+
+    class ControlledIntersectionObserver {
+      static latest: ControlledIntersectionObserver | undefined
+      observed: Element[] = []
+      disconnected = false
+
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        ControlledIntersectionObserver.latest = this
+      }
+
+      observe(target: Element) {
+        this.observed.push(target)
+      }
+
+      unobserve(target: Element) {
+        this.observed = this.observed.filter((entry) => entry !== target)
+      }
+
+      disconnect() {
+        this.disconnected = true
+        this.observed = []
+      }
+
+      trigger(target: Element) {
+        this.callback([{ target, isIntersecting: true } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+      }
+
+      takeRecords() {
+        return []
+      }
+
+      readonly root = null
+      readonly rootMargin = '0px'
+      readonly thresholds = []
+    }
+
+    window.requestAnimationFrame = ((callback: FrameRequestCallback) => {
+      animationFrames.push(callback)
+      return animationFrames.length
+    }) as typeof window.requestAnimationFrame
+    Object.defineProperty(globalThis, 'IntersectionObserver', {
+      configurable: true,
+      writable: true,
+      value: ControlledIntersectionObserver,
+    })
+    vi.mocked(invoke).mockClear()
+    vi.mocked(invoke).mockImplementation(async () => ({ url: 'data:image/png;base64,AA==' }))
+
+    const wrapper = mount(ReadingMode, {
+      attachTo: document.body,
+      props: {
+        document: {
+          html: '<span data-md-resource-id="image-near">near</span><p style="margin-top: 8000px"></p><span data-md-resource-id="image-far">far</span>',
+          outline: [],
+          resources: [
+            { id: 'image-near', kind: 'data', source: 'data:image/png;base64,AA==', alt: 'near' },
+            { id: 'image-far', kind: 'data', source: 'data:image/png;base64,AA==', alt: 'far' },
+          ],
+          links: [], diagrams: [], diagnostics: [],
+          stats: { inputBytes: 1, astNodes: 3, headingCount: 0, diagramCount: 0 },
+        },
+        title: 'lazy-images.md', documentId: 'document-lazy-images', active: true,
+        initialScrollRatio: 0, remoteImageAuthorized: false,
       },
     })
 
+    try {
+      for (let frame = 0; frame < 5; frame += 1) {
+        await wrapper.vm.$nextTick()
+        animationFrames.splice(0).forEach((callback) => callback(performance.now()))
+        await Promise.resolve()
+      }
+      await vi.waitFor(() => expect(ControlledIntersectionObserver.latest?.observed).toHaveLength(2))
+      expect(invoke).not.toHaveBeenCalled()
+
+      const firstPlaceholder = ControlledIntersectionObserver.latest?.observed[0]
+      expect(firstPlaceholder).toBeDefined()
+      if (firstPlaceholder) ControlledIntersectionObserver.latest?.trigger(firstPlaceholder)
+      await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1))
+      expect(ControlledIntersectionObserver.latest?.observed).toHaveLength(1)
+
+      const staleObserver = ControlledIntersectionObserver.latest
+      const stalePlaceholder = staleObserver?.observed[0]
+      expect(stalePlaceholder).toBeDefined()
+      await wrapper.setProps({
+        document: {
+          html: '<span data-md-resource-id="image-replacement">replacement</span>',
+          outline: [],
+          resources: [{ id: 'image-replacement', kind: 'data', source: 'data:image/png;base64,AA==', alt: 'replacement' }],
+          links: [], diagrams: [], diagnostics: [],
+          stats: { inputBytes: 1, astNodes: 1, headingCount: 0, diagramCount: 0 },
+        },
+        documentId: 'document-replacement',
+        renderGeneration: 2,
+      })
+      for (let frame = 0; frame < 5; frame += 1) {
+        await wrapper.vm.$nextTick()
+        animationFrames.splice(0).forEach((callback) => callback(performance.now()))
+        await Promise.resolve()
+      }
+      await vi.waitFor(() => expect(ControlledIntersectionObserver.latest?.observed).toHaveLength(1))
+      const replacementObserver = ControlledIntersectionObserver.latest
+      const replacementPlaceholder = replacementObserver?.observed[0]
+      expect(staleObserver?.disconnected).toBe(true)
+      expect(replacementObserver).not.toBe(staleObserver)
+
+      vi.mocked(invoke).mockClear()
+      if (stalePlaceholder) staleObserver?.trigger(stalePlaceholder)
+      await Promise.resolve()
+      expect(invoke).not.toHaveBeenCalled()
+      if (replacementPlaceholder) replacementObserver?.trigger(replacementPlaceholder)
+      await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1))
+
+      wrapper.unmount()
+      expect(replacementObserver?.disconnected).toBe(true)
+      vi.mocked(invoke).mockClear()
+      if (replacementPlaceholder) replacementObserver?.trigger(replacementPlaceholder)
+      await Promise.resolve()
+      expect(invoke).not.toHaveBeenCalled()
+    } finally {
+      wrapper.unmount()
+      window.requestAnimationFrame = originalRequestAnimationFrame
+      Object.defineProperty(globalThis, 'IntersectionObserver', {
+        configurable: true,
+        writable: true,
+        value: originalIntersectionObserver,
+      })
+      vi.mocked(invoke).mockImplementation(async () => ({ url: 'data:image/png;base64,AA==' }))
+    }
+  })
+
+  it('keeps search outside reading settings and closes settings from its backdrop', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+
+    await wrapper.get('.reader-settings-toggle').trigger('click')
     await vi.waitFor(() => expect(wrapper.find('.reader-settings').exists()).toBe(true))
     expect(wrapper.find('.reader-settings input[aria-label="搜索文档"]').exists()).toBe(false)
     await wrapper.get('[data-reader-settings-backdrop]').trigger('click')
-    expect(wrapper.emitted('update-settings-open')).toContainEqual([false])
+    expect(wrapper.find('.reader-settings').exists()).toBe(false)
     wrapper.unmount()
   })
 
@@ -224,6 +425,7 @@ describe('reader controls', () => {
     const readingModeSource = readFileSync(resolve(process.cwd(), 'src/components/ReadingMode.vue'), 'utf8')
     const lightboxSource = readFileSync(resolve(process.cwd(), 'src/components/MediaLightbox.vue'), 'utf8')
     const tabBarSource = readFileSync(resolve(process.cwd(), 'src/components/TabBar.vue'), 'utf8')
+    const markdownComposableSource = readFileSync(resolve(process.cwd(), 'src/composables/useMarkdown.ts'), 'utf8')
 
     expect(appSource).toContain('data-icon="settings"')
     expect(appSource).toContain("document.addEventListener('pointerdown', closeSettingsOnOutside)")
@@ -261,6 +463,10 @@ describe('reader controls', () => {
     expect(readingModeSource).toContain('.preview-area :deep(th) { background: #f2f2f2 !important; }')
     expect(lightboxSource).toContain('@media print')
     expect(tabBarSource).toContain('@media print')
+    expect(markdownComposableSource).not.toContain("import { renderMarkdown")
+    expect(markdownComposableSource).toContain("await import('../markdown/renderer')")
+    expect(appSource).not.toContain('JSON.stringify(document)')
+    expect(appSource).toContain('prepareMarkdown()')
   })
 
   it('keeps tab selection and keyboard close behavior accessible', async () => {

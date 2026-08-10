@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.1.0"
+version = "1.0.0"
 description = "屿阅：隐私优先的本地 Markdown 阅读器"
 license = "MIT"
 edition = "2021"

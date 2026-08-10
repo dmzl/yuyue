@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, shallowRef, useTemplateRef } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, shallowRef, useTemplateRef, watch } from 'vue'
 import type { RenderDocument } from '../markdown/renderer'
 import { useLocale } from '../composables/useLocale'
+import TabOverflowMenu from './TabOverflowMenu.vue'
 
 export interface Tab {
   id: string
@@ -15,6 +16,7 @@ export interface Tab {
   lastAccess: number
   isRendering: boolean
   renderGeneration: number
+  paintOperationId?: string
   scrollRatio: number
   remoteImageAuthorized: boolean
   error?: string
@@ -43,7 +45,48 @@ const contextMenu = shallowRef<{
 }>({ visible: false, x: 0, y: 0, tabId: '', tabIndex: 0 })
 const contextMenuRef = useTemplateRef<HTMLElement>('contextMenu')
 const contextMenuReturnTarget = shallowRef<HTMLElement | null>(null)
+const tabBarRef = useTemplateRef<HTMLElement>('tabBar')
+const tabStripRef = useTemplateRef<HTMLElement>('tabStrip')
+const availableWidth = shallowRef(0)
+const overflowOpen = shallowRef(false)
 const { t } = useLocale()
+const MIN_TAB_WIDTH = 168
+const OVERFLOW_TRIGGER_WIDTH = 50
+let tabResizeObserver: { disconnect: () => void; observe: (target: Element) => void } | undefined
+
+const visibleTabCount = computed(() => {
+  const tabCount = props.tabs.length
+  if (tabCount === 0) return 0
+  if (availableWidth.value <= 0) return tabCount
+  if (tabCount * MIN_TAB_WIDTH <= availableWidth.value) return tabCount
+  return Math.max(1, Math.floor((availableWidth.value - OVERFLOW_TRIGGER_WIDTH) / MIN_TAB_WIDTH))
+})
+const visibleStartIndex = computed(() => {
+  const count = visibleTabCount.value
+  if (count >= props.tabs.length) return 0
+  const activeIndex = Math.max(0, props.tabs.findIndex((tab) => tab.id === props.activeTabId))
+  const preferredStart = activeIndex - Math.floor(count / 2)
+  return Math.min(Math.max(preferredStart, 0), props.tabs.length - count)
+})
+const visibleTabs = computed(() => props.tabs.slice(visibleStartIndex.value, visibleStartIndex.value + visibleTabCount.value))
+const hiddenTabs = computed(() => {
+  const visibleIds = new Set(visibleTabs.value.map((tab) => tab.id))
+  return props.tabs.filter((tab) => !visibleIds.has(tab.id))
+})
+
+function measureAvailableWidth() {
+  availableWidth.value = tabBarRef.value?.clientWidth ?? 0
+}
+
+function scheduleAvailableWidthMeasurement() {
+  void nextTick(() => {
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(measureAvailableWidth)
+    } else {
+      measureAvailableWidth()
+    }
+  })
+}
 
 function activateByOffset(tabId: string, offset: number) {
   const index = props.tabs.findIndex((tab) => tab.id === tabId)
@@ -55,10 +98,16 @@ function activateByOffset(tabId: string, offset: number) {
 function activateAndFocus(tabId: string) {
   emit('activate', tabId)
   void nextTick(() => {
-    const target = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-tab-id]'))
+    const target = Array.from(tabStripRef.value?.querySelectorAll<HTMLButtonElement>('[data-tab-id]') ?? [])
       .find((element) => element.dataset.tabId === tabId)
     target?.focus()
   })
+}
+
+function focusActiveTab() {
+  const target = Array.from(tabStripRef.value?.querySelectorAll<HTMLButtonElement>('[data-tab-id]') ?? [])
+    .find((element) => element.dataset.tabId === props.activeTabId)
+  target?.focus()
 }
 
 function handleTabKeydown(event: KeyboardEvent, tabId: string) {
@@ -131,55 +180,72 @@ function handleGlobalClick() {
   if (contextMenu.value.visible) closeContextMenu()
 }
 
-function handleWheel(event: WheelEvent) {
-  const container = event.currentTarget as HTMLElement
-  if (event.deltaY !== 0) {
-    event.preventDefault()
-    container.scrollLeft += event.deltaY
+watch([() => props.tabs.length, () => props.activeTabId], () => {
+  scheduleAvailableWidthMeasurement()
+}, { flush: 'post' })
+watch(hiddenTabs, (tabs) => {
+  if (tabs.length === 0 && overflowOpen.value) {
+    overflowOpen.value = false
+    void nextTick(focusActiveTab)
   }
-}
+})
 
-onMounted(() => document.addEventListener('click', handleGlobalClick))
-onUnmounted(() => document.removeEventListener('click', handleGlobalClick))
+onMounted(() => {
+  document.addEventListener('click', handleGlobalClick)
+  window.addEventListener('resize', measureAvailableWidth)
+  scheduleAvailableWidthMeasurement()
+  if (window.ResizeObserver && tabBarRef.value) {
+    tabResizeObserver = new window.ResizeObserver(measureAvailableWidth)
+    tabResizeObserver.observe(tabBarRef.value)
+  }
+})
+onUnmounted(() => {
+  document.removeEventListener('click', handleGlobalClick)
+  window.removeEventListener('resize', measureAvailableWidth)
+  tabResizeObserver?.disconnect()
+})
 </script>
 
 <template>
-  <div class="tab-bar" role="tablist" :aria-label="t('openDocuments')" @wheel="handleWheel">
-    <div
-      v-for="tab in props.tabs"
-      :key="tab.id"
-      :class="['tab-item', { active: tab.id === props.activeTabId, 'has-error': tab.error }]"
-      role="presentation"
-    >
-      <button
-        type="button"
-        role="tab"
-        class="tab-select"
-        :data-tab-id="tab.id"
-        :aria-label="t('switchTo', { name: tab.fileName })"
-        :aria-selected="tab.id === props.activeTabId"
-        :tabindex="tab.id === props.activeTabId ? 0 : -1"
-        @click="emit('activate', tab.id)"
-        @keydown="handleTabKeydown($event, tab.id)"
-        @contextmenu="handleContextMenu($event, tab)"
+  <div ref="tabBar" class="tab-bar">
+    <div ref="tabStrip" class="tab-strip" role="tablist" :aria-label="t('openDocuments')">
+      <div
+        v-for="tab in visibleTabs"
+        :key="tab.id"
+        :class="['tab-item', { active: tab.id === props.activeTabId, 'has-error': tab.error }]"
+        role="presentation"
       >
-        <span class="tab-icon" aria-hidden="true">{{ tab.error ? '!' : '•' }}</span>
-        <span class="tab-name">{{ tab.fileName }}</span>
-        <span v-if="tab.error" class="tab-status" :title="t('documentHasError')">{{ t('needsAttention') }}</span>
-        <span v-if="tab.id === props.activeTabId && !tab.error" class="tab-live" aria-hidden="true"></span>
-      </button>
-      <button
-        type="button"
-        class="tab-close"
-        :aria-label="t('closeDocument')"
-        :title="t('closeDocument')"
-        @click.stop="emit('close', tab.id)"
-        @keydown.enter.stop="emit('close', tab.id)"
-        @keydown.space.prevent.stop="emit('close', tab.id)"
-      >
-        ×
-      </button>
+        <button
+          type="button"
+          role="tab"
+          class="tab-select"
+          :data-tab-id="tab.id"
+          :aria-label="t('switchTo', { name: tab.fileName })"
+          :aria-selected="tab.id === props.activeTabId"
+          :tabindex="tab.id === props.activeTabId ? 0 : -1"
+          @click="emit('activate', tab.id)"
+          @keydown="handleTabKeydown($event, tab.id)"
+          @contextmenu="handleContextMenu($event, tab)"
+        >
+          <span class="tab-icon" aria-hidden="true">{{ tab.error ? '!' : '•' }}</span>
+          <span class="tab-name">{{ tab.fileName }}</span>
+          <span v-if="tab.error" class="tab-status" :title="t('documentHasError')">{{ t('needsAttention') }}</span>
+          <span v-if="tab.id === props.activeTabId && !tab.error" class="tab-live" aria-hidden="true"></span>
+        </button>
+        <button
+          type="button"
+          class="tab-close"
+          :aria-label="t('closeDocument')"
+          :title="t('closeDocument')"
+          @click.stop="emit('close', tab.id)"
+          @keydown.enter.stop="emit('close', tab.id)"
+          @keydown.space.prevent.stop="emit('close', tab.id)"
+        >
+          ×
+        </button>
+      </div>
     </div>
+    <TabOverflowMenu v-if="hiddenTabs.length > 0" v-model:open="overflowOpen" :tabs="hiddenTabs" @activate="activateAndFocus" />
   </div>
 
   <Teleport to="body">
@@ -205,9 +271,9 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick))
 </template>
 
 <style scoped>
-.tab-bar { display: flex; align-items: stretch; min-height: 0; height: 100%; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
-.tab-bar::-webkit-scrollbar { display: none; }
-.tab-item { position: relative; display: flex; align-items: center; min-width: 130px; max-width: 240px; height: 38px; padding: 0 9px 0 12px; flex-shrink: 0; border-right: 1px solid var(--border-color); border-radius: 8px 8px 0 0; color: var(--text-muted); background: transparent; user-select: none; }
+.tab-bar { position: relative; display: flex; align-items: stretch; min-width: 0; height: 100%; }
+.tab-strip { display: flex; min-width: 0; flex: 1; overflow: hidden; }
+.tab-item { position: relative; display: flex; align-items: center; min-width: 168px; max-width: 240px; height: 38px; padding: 0 9px 0 12px; flex: 1 1 192px; border-right: 1px solid var(--border-color); border-radius: 8px 8px 0 0; color: var(--text-muted); background: transparent; user-select: none; }
 .tab-item:hover { background: var(--tool-btn-hover-bg); color: var(--text-primary); }
 .tab-item.active { color: var(--text-primary); background: var(--bg-primary); box-shadow: inset 0 -2px #4c6ef5; }
 .tab-select { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 1; height: 100%; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; font: inherit; font-size: 12px; text-align: left; }

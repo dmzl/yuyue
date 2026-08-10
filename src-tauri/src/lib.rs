@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{Cursor, Read},
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -24,6 +24,8 @@ use objc2_foundation::{NSCopying, NSString};
 
 const MAX_DOCUMENT_INPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_OPEN_DOCUMENTS: usize = 32;
+const MAX_IMPORT_OPERATIONS: usize = 32;
+const MAX_ACTIVE_IMPORTS: usize = 4;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_SVG_BYTES: usize = 5 * 1024 * 1024;
@@ -38,6 +40,21 @@ const PRINT_MARGIN_BOTTOM_POINTS: f64 = 56.7;
 
 static FILE_WATCHERS: LazyLock<Mutex<HashMap<String, notify::RecommendedWatcher>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// Parsing every local SVG used to scan the complete system font catalog. A document
+// with several diagrams therefore repeated a large, synchronous initialization on
+// the import path. The immutable database is safe to share across parses: usvg only
+// clones it when a caller explicitly asks to mutate it.
+static SVG_FONT_DATABASE: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    Arc::new(database)
+});
+
+// SVG rasterization can allocate and encode several megabytes per diagram. Keep
+// that work bounded when two documents begin their deferred image enhancement at
+// nearly the same time; it runs on a blocking worker, never on the UI path.
+static SVG_RASTERIZATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +86,114 @@ struct DocumentErrorEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentOpenedEvent {
+    operation_id: String,
+    sequence: u64,
+    document: DocumentPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentImportErrorEvent {
+    operation_id: String,
+    sequence: u64,
+    code: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentImportOperation {
+    operation_id: String,
+    sequence: u64,
+    file_name: String,
+}
+
+impl DocumentImportOperation {
+    #[cfg(test)]
+    fn for_test(operation_id: &str, sequence: u64, file_name: &str) -> Self {
+        Self {
+            operation_id: operation_id.to_string(),
+            sequence,
+            file_name: file_name.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingImport {
+    kind: String,
+    operation_id: String,
+    sequence: u64,
+    file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<DocumentPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+impl PendingImport {
+    fn opened(operation: DocumentImportOperation, document: DocumentPayload) -> Self {
+        Self {
+            kind: "opened".to_string(),
+            operation_id: operation.operation_id,
+            sequence: operation.sequence,
+            file_name: operation.file_name,
+            document: Some(document),
+            code: None,
+        }
+    }
+
+    fn error(operation: DocumentImportOperation, code: String) -> Self {
+        Self {
+            kind: "error".to_string(),
+            operation_id: operation.operation_id,
+            sequence: operation.sequence,
+            file_name: operation.file_name,
+            document: None,
+            code: Some(code),
+        }
+    }
+
+    fn document_id(&self) -> Option<&str> {
+        self.document
+            .as_ref()
+            .map(|document| document.document_id.as_str())
+    }
+
+    fn operation(&self) -> DocumentImportOperation {
+        DocumentImportOperation {
+            operation_id: self.operation_id.clone(),
+            sequence: self.sequence,
+            file_name: self.file_name.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ImportJob {
+    operation: DocumentImportOperation,
+    path: PathBuf,
+    started_published: bool,
+}
+
+#[cfg(test)]
+impl ImportJob {
+    fn for_test(sequence: u64) -> Self {
+        Self {
+            operation: DocumentImportOperation {
+                operation_id: format!("operation-{sequence}"),
+                sequence,
+                file_name: format!("document-{sequence}.md"),
+            },
+            path: PathBuf::from(format!("document-{sequence}.md")),
+            started_published: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct PrintErrorEvent {
     code: String,
 }
@@ -87,66 +212,115 @@ struct DocumentContext {
     revision: u64,
     resources: HashMap<String, ResourceSnapshot>,
     resource_bytes: usize,
+    creator_operation_id: String,
+    published: bool,
+    claims: HashSet<String>,
+    pending_owner_count: usize,
+}
+
+#[derive(Debug)]
+struct PreparedDocument {
+    path: PathBuf,
+    root: PathBuf,
+    file_name: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct PreparedImage {
+    bytes: Vec<u8>,
+    mime: &'static str,
+}
+
+#[derive(Debug)]
+struct LocalImageResolution {
+    identity: String,
+    root: PathBuf,
+    cached_url: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct DocumentRegistry {
     documents: HashMap<String, DocumentContext>,
     path_index: HashMap<PathBuf, String>,
-    pending: Option<DocumentPayload>,
+    pending_import: Option<PendingImport>,
     frontend_ready: bool,
     total_resources: usize,
     total_bytes: usize,
+    import_queue: VecDeque<ImportJob>,
+    active_imports: usize,
+    import_reserved_bytes: usize,
+    import_sequence: u64,
 }
 
 impl DocumentRegistry {
-    fn open_document(&mut self, path: PathBuf) -> Result<DocumentPayload, String> {
-        let input_metadata =
-            fs::symlink_metadata(&path).map_err(|_| "DOCUMENT_OPEN_FAILED".to_string())?;
-        if input_metadata.file_type().is_symlink() {
-            return Err("DOCUMENT_IDENTITY_CHANGED".to_string());
-        }
-        if !input_metadata.is_file() {
-            return Err("DOCUMENT_NOT_A_FILE".to_string());
-        }
-        let path = fs::canonicalize(path).map_err(|_| "DOCUMENT_OPEN_FAILED".to_string())?;
-        if !is_supported_file(&path) {
-            return Err("DOCUMENT_UNSUPPORTED_FORMAT".to_string());
-        }
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|_| "DOCUMENT_OPEN_FAILED".to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err("DOCUMENT_IDENTITY_CHANGED".to_string());
-        }
-        if !metadata.is_file() {
-            return Err("DOCUMENT_NOT_A_FILE".to_string());
-        }
-        if metadata.len() > MAX_DOCUMENT_INPUT_BYTES as u64 {
-            return Err("DOCUMENT_TOO_LARGE".to_string());
-        }
-        validate_canonical_document_path(&path)?;
-        let content = read_document_content(&path)?;
-        let root = path
-            .parent()
-            .ok_or_else(|| "DOCUMENT_OPEN_FAILED".to_string())?
-            .to_path_buf();
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| "DOCUMENT_OPEN_FAILED".to_string())?
-            .to_string();
+    fn begin_import(&mut self, path: &Path) -> (DocumentImportOperation, bool) {
+        self.import_sequence = self.import_sequence.saturating_add(1);
+        (
+            DocumentImportOperation {
+                operation_id: Uuid::new_v4().simple().to_string(),
+                sequence: self.import_sequence,
+                file_name: safe_file_label(path),
+            },
+            self.frontend_ready,
+        )
+    }
 
+    fn enqueue_import(&mut self, job: ImportJob) -> Result<(), String> {
+        if self.import_queue.len() + self.active_imports >= MAX_IMPORT_OPERATIONS {
+            return Err("DOCUMENT_TAB_LIMIT".to_string());
+        }
+        self.import_queue.push_back(job);
+        Ok(())
+    }
+
+    fn start_next_import(&mut self) -> Option<ImportJob> {
+        if self.active_imports >= MAX_ACTIVE_IMPORTS {
+            return None;
+        }
+        let job = self.import_queue.pop_front()?;
+        self.active_imports += 1;
+        self.import_reserved_bytes += MAX_DOCUMENT_INPUT_BYTES;
+        Some(job)
+    }
+
+    fn finish_import_slot(&mut self) {
+        self.active_imports = self.active_imports.saturating_sub(1);
+        self.import_reserved_bytes = self
+            .import_reserved_bytes
+            .saturating_sub(MAX_DOCUMENT_INPUT_BYTES);
+    }
+
+    #[cfg(test)]
+    fn open_document(&mut self, path: PathBuf) -> Result<DocumentPayload, String> {
+        let operation_id = format!("sync-{}", Uuid::new_v4().simple());
+        let payload = self.commit_prepared(prepare_document(path)?, &operation_id)?;
+        self.publish_claim(&payload.document_id, &operation_id);
+        Ok(payload)
+    }
+
+    fn commit_prepared(
+        &mut self,
+        prepared: PreparedDocument,
+        operation_id: &str,
+    ) -> Result<DocumentPayload, String> {
+        let PreparedDocument {
+            path,
+            root,
+            file_name,
+            content,
+        } = prepared;
         if let Some(existing_id) = self.path_index.get(&path).cloned() {
-            let revision = self
+            let context = self
                 .documents
-                .get(&existing_id)
-                .map(|context| context.revision)
+                .get_mut(&existing_id)
                 .ok_or_else(|| "DOCUMENT_NOT_FOUND".to_string())?;
+            context.claims.insert(operation_id.to_string());
             return Ok(DocumentPayload {
                 document_id: existing_id,
                 file_name,
                 content,
-                source_revision: revision,
+                source_revision: context.revision,
             });
         }
 
@@ -170,9 +344,76 @@ impl DocumentRegistry {
                 revision: 0,
                 resources: HashMap::new(),
                 resource_bytes: 0,
+                creator_operation_id: operation_id.to_string(),
+                published: false,
+                claims: HashSet::from([operation_id.to_string()]),
+                pending_owner_count: 0,
             },
         );
         Ok(payload)
+    }
+
+    fn publish_claim(&mut self, document_id: &str, operation_id: &str) {
+        if let Some(context) = self.documents.get_mut(document_id) {
+            context.published = true;
+            context.claims.remove(operation_id);
+        }
+        self.reap_unpublished(document_id);
+    }
+
+    fn release_claim(&mut self, document_id: &str, operation_id: &str) {
+        if let Some(context) = self.documents.get_mut(document_id) {
+            context.claims.remove(operation_id);
+        }
+        self.reap_unpublished(document_id);
+    }
+
+    fn reap_unpublished(&mut self, document_id: &str) {
+        let should_reap = self.documents.get(document_id).is_some_and(|context| {
+            !context.creator_operation_id.is_empty()
+                && !context.published
+                && context.claims.is_empty()
+                && context.pending_owner_count == 0
+        });
+        if should_reap {
+            self.close_document(document_id);
+        }
+    }
+
+    fn queue_pending_import(&mut self, pending: PendingImport) {
+        let new_document_id = pending.document_id().map(str::to_string);
+        let operation_id = pending.operation_id.clone();
+        if let Some(document_id) = new_document_id.as_deref() {
+            if let Some(context) = self.documents.get_mut(document_id) {
+                context.pending_owner_count += 1;
+            }
+        }
+        let previous = self.pending_import.replace(pending);
+        if let Some(document_id) = previous.as_ref().and_then(PendingImport::document_id) {
+            self.release_pending_owner(document_id);
+        }
+        if let Some(document_id) = new_document_id.as_deref() {
+            self.release_claim(document_id, &operation_id);
+        }
+    }
+
+    fn release_pending_owner(&mut self, document_id: &str) {
+        if let Some(context) = self.documents.get_mut(document_id) {
+            context.pending_owner_count = context.pending_owner_count.saturating_sub(1);
+        }
+        self.reap_unpublished(document_id);
+    }
+
+    fn take_pending_import(&mut self) -> Option<PendingImport> {
+        self.frontend_ready = true;
+        let pending = self.pending_import.take()?;
+        if let Some(document_id) = pending.document_id() {
+            if let Some(context) = self.documents.get_mut(document_id) {
+                context.published = true;
+            }
+            self.release_pending_owner(document_id);
+        }
+        Some(pending)
     }
 
     fn close_document(&mut self, document_id: &str) {
@@ -189,13 +430,6 @@ impl DocumentRegistry {
             .and_then(|context| context.path.file_name())
             .and_then(|file_name| file_name.to_str())
             .map(suggested_pdf_file_name)
-    }
-
-    fn queue_document(&mut self, payload: DocumentPayload) {
-        if let Some(pending) = self.pending.take() {
-            self.close_document(&pending.document_id);
-        }
-        self.pending = Some(payload);
     }
 
     fn reload_document(
@@ -253,6 +487,7 @@ impl DocumentRegistry {
         Ok(context.revision)
     }
 
+    #[cfg(test)]
     fn resolve_image(
         &mut self,
         document_id: &str,
@@ -276,60 +511,47 @@ impl DocumentRegistry {
         }
     }
 
+    #[cfg(test)]
     fn snapshot_local_image(
         &mut self,
         document_id: &str,
         source: &str,
     ) -> Result<ResolvedImageSource, String> {
-        let identity = normalize_relative_source(source)?;
-        let (root, cached_url) = self
-            .documents
-            .get(document_id)
-            .map(|context| {
-                (
-                    context.root.clone(),
-                    context
-                        .resources
-                        .get(&identity)
-                        .map(|snapshot| image_protocol_url(document_id, &snapshot.resource_id)),
-                )
-            })
-            .ok_or_else(|| "DOCUMENT_NOT_FOUND".to_string())?;
-        if let Some(url) = cached_url {
+        let resolution = self.local_image_resolution(document_id, source)?;
+        if let Some(url) = resolution.cached_url {
             return Ok(ResolvedImageSource { url });
         }
 
-        let extension = Path::new(&identity)
-            .extension()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| "IMAGE_UNSUPPORTED_FORMAT".to_string())?
-            .to_string();
-        let mut file = open_image_no_follow(&root, &identity)?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| "IMAGE_OPEN_FAILED".to_string())?;
-        if !metadata.is_file() {
-            return Err("IMAGE_NOT_A_FILE".to_string());
-        }
-        let mut bytes = Vec::with_capacity(metadata.len().min(MAX_IMAGE_BYTES as u64) as usize + 1);
-        file.by_ref()
-            .take((MAX_IMAGE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "IMAGE_READ_FAILED".to_string())?;
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return Err("IMAGE_TOO_LARGE".to_string());
-        }
-        self.snapshot_image_bytes(document_id, identity, &extension, bytes)
+        let prepared = prepare_local_image(&resolution.root, &resolution.identity)?;
+        self.store_prepared_image(document_id, resolution.identity, prepared)
     }
 
-    fn snapshot_image_bytes(
+    fn local_image_resolution(
+        &self,
+        document_id: &str,
+        source: &str,
+    ) -> Result<LocalImageResolution, String> {
+        let identity = normalize_relative_source(source)?;
+        self.documents
+            .get(document_id)
+            .map(|context| LocalImageResolution {
+                cached_url: context
+                    .resources
+                    .get(&identity)
+                    .map(|snapshot| image_protocol_url(document_id, &snapshot.resource_id)),
+                identity,
+                root: context.root.clone(),
+            })
+            .ok_or_else(|| "DOCUMENT_NOT_FOUND".to_string())
+    }
+
+    fn store_prepared_image(
         &mut self,
         document_id: &str,
         identity: String,
-        extension: &str,
-        bytes: Vec<u8>,
+        prepared: PreparedImage,
     ) -> Result<ResolvedImageSource, String> {
-        let (bytes, mime) = prepare_image_bytes(extension, &bytes)?;
+        let PreparedImage { bytes, mime } = prepared;
         let context = self
             .documents
             .get_mut(document_id)
@@ -366,6 +588,18 @@ impl DocumentRegistry {
         })
     }
 
+    #[cfg(test)]
+    fn snapshot_image_bytes(
+        &mut self,
+        document_id: &str,
+        identity: String,
+        extension: &str,
+        bytes: Vec<u8>,
+    ) -> Result<ResolvedImageSource, String> {
+        let (bytes, mime) = prepare_image_bytes(extension, &bytes)?;
+        self.store_prepared_image(document_id, identity, PreparedImage { bytes, mime })
+    }
+
     fn protocol_snapshot(&self, document_id: &str, resource_id: &str) -> Option<&ResourceSnapshot> {
         self.documents
             .get(document_id)?
@@ -373,6 +607,59 @@ impl DocumentRegistry {
             .values()
             .find(|snapshot| snapshot.resource_id == resource_id)
     }
+}
+
+fn safe_file_label(path: &Path) -> String {
+    let raw = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let normalized = raw
+        .chars()
+        .filter(|character| {
+            !matches!(
+                *character,
+                '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded = collapsed.chars().take(120).collect::<String>();
+    if bounded.is_empty() {
+        "document.md".to_string()
+    } else {
+        bounded
+    }
+}
+
+fn prepare_document(path: PathBuf) -> Result<PreparedDocument, String> {
+    let input_metadata =
+        fs::symlink_metadata(&path).map_err(|_| "DOCUMENT_OPEN_FAILED".to_string())?;
+    if input_metadata.file_type().is_symlink() {
+        return Err("DOCUMENT_IDENTITY_CHANGED".to_string());
+    }
+    if !input_metadata.is_file() {
+        return Err("DOCUMENT_NOT_A_FILE".to_string());
+    }
+    let path = fs::canonicalize(path).map_err(|_| "DOCUMENT_OPEN_FAILED".to_string())?;
+    if !is_supported_file(&path) {
+        return Err("DOCUMENT_UNSUPPORTED_FORMAT".to_string());
+    }
+    validate_canonical_document_path(&path)?;
+    let content = read_document_content(&path)?;
+    validate_canonical_document_path(&path)?;
+    let root = path
+        .parent()
+        .ok_or_else(|| "DOCUMENT_OPEN_FAILED".to_string())?
+        .to_path_buf();
+    let file_name = safe_file_label(&path);
+    Ok(PreparedDocument {
+        path,
+        root,
+        file_name,
+        content,
+    })
 }
 
 fn read_document_content(path: &Path) -> Result<String, String> {
@@ -638,6 +925,37 @@ fn open_image_no_follow(_: &Path, _: &str) -> Result<File, String> {
     Err("IMAGE_PLATFORM_UNSUPPORTED".to_string())
 }
 
+fn prepare_local_image(root: &Path, identity: &str) -> Result<PreparedImage, String> {
+    let extension = Path::new(identity)
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "IMAGE_UNSUPPORTED_FORMAT".to_string())?
+        .to_string();
+    let mut file = open_image_no_follow(root, identity)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "IMAGE_OPEN_FAILED".to_string())?;
+    if !metadata.is_file() {
+        return Err("IMAGE_NOT_A_FILE".to_string());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_IMAGE_BYTES as u64) as usize + 1);
+    file.by_ref()
+        .take((MAX_IMAGE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "IMAGE_READ_FAILED".to_string())?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err("IMAGE_TOO_LARGE".to_string());
+    }
+    let (bytes, mime) = prepare_image_bytes(&extension, &bytes)?;
+    Ok(PreparedImage { bytes, mime })
+}
+
+fn prepare_data_image(source: &str) -> Result<(String, PreparedImage), String> {
+    let (extension, bytes) = decode_data_image(source)?;
+    let (bytes, mime) = prepare_image_bytes(extension, &bytes)?;
+    Ok((source.to_string(), PreparedImage { bytes, mime }))
+}
+
 #[cfg(test)]
 fn validate_image_bytes(extension: &str, bytes: &[u8]) -> Result<&'static str, String> {
     prepare_image_bytes(extension, bytes).map(|(_, mime)| mime)
@@ -676,6 +994,9 @@ fn rasterize_safe_svg(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.is_empty() || bytes.len() > MAX_SVG_BYTES || !is_safe_svg_markup(bytes) {
         return Err("SVG_UNSAFE_CONTENT".to_string());
     }
+    let _rasterization = SVG_RASTERIZATION_LOCK
+        .lock()
+        .map_err(|_| "SVG_RENDER_FAILED".to_string())?;
     let options = safe_svg_options();
     let tree =
         usvg::Tree::from_data(bytes, &options).map_err(|_| "SVG_UNSAFE_CONTENT".to_string())?;
@@ -711,7 +1032,7 @@ fn safe_svg_options() -> usvg::Options<'static> {
         },
         ..Default::default()
     };
-    options.fontdb_mut().load_system_fonts();
+    options.fontdb = Arc::clone(&SVG_FONT_DATABASE);
     options
 }
 
@@ -809,32 +1130,136 @@ fn empty_response(status: http::StatusCode) -> http::Response<Vec<u8>> {
         .expect("response builder")
 }
 
-fn publish_document(app: &AppHandle, path: PathBuf, queue_if_needed: bool) {
-    let result = app
+fn emit_import_terminal(app: &AppHandle, pending: PendingImport, started_published: bool) {
+    let operation = pending.operation();
+    if !started_published {
+        let _ = app.emit("document-import-started", operation.clone());
+    }
+    if let Some(document) = pending.document {
+        let document_id = document.document_id.clone();
+        let opened = DocumentOpenedEvent {
+            operation_id: operation.operation_id.clone(),
+            sequence: operation.sequence,
+            document,
+        };
+        if app.emit("document-opened", opened).is_ok() {
+            app.state::<Mutex<DocumentRegistry>>()
+                .lock()
+                .expect("document registry")
+                .publish_claim(&document_id, &operation.operation_id);
+        } else {
+            app.state::<Mutex<DocumentRegistry>>()
+                .lock()
+                .expect("document registry")
+                .release_claim(&document_id, &operation.operation_id);
+            let _ = app.emit(
+                "document-import-error",
+                DocumentImportErrorEvent {
+                    operation_id: operation.operation_id,
+                    sequence: operation.sequence,
+                    code: "DOCUMENT_OPEN_FAILED".to_string(),
+                },
+            );
+        }
+    } else {
+        let _ = app.emit(
+            "document-import-error",
+            DocumentImportErrorEvent {
+                operation_id: operation.operation_id,
+                sequence: operation.sequence,
+                code: pending
+                    .code
+                    .unwrap_or_else(|| "DOCUMENT_OPEN_FAILED".to_string()),
+            },
+        );
+    }
+}
+
+fn publish_import_result(
+    app: &AppHandle,
+    operation: DocumentImportOperation,
+    started_published: bool,
+    prepared: Result<PreparedDocument, String>,
+) {
+    let (pending, frontend_ready) = {
+        let registry_state = app.state::<Mutex<DocumentRegistry>>();
+        let mut registry = registry_state.lock().expect("document registry");
+        let pending = match prepared {
+            Ok(prepared) => match registry.commit_prepared(prepared, &operation.operation_id) {
+                Ok(document) => PendingImport::opened(operation, document),
+                Err(code) => PendingImport::error(operation, code),
+            },
+            Err(code) => PendingImport::error(operation, code),
+        };
+        if !registry.frontend_ready {
+            registry.queue_pending_import(pending);
+            return;
+        }
+        (pending, true)
+    };
+    if frontend_ready {
+        emit_import_terminal(app, pending, started_published);
+    }
+}
+
+fn drive_import_queue(app: &AppHandle) {
+    loop {
+        let job = app
+            .state::<Mutex<DocumentRegistry>>()
+            .lock()
+            .expect("document registry")
+            .start_next_import();
+        let Some(job) = job else {
+            return;
+        };
+        let ImportJob {
+            operation,
+            path,
+            started_published,
+        } = job;
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let prepared =
+                match tauri::async_runtime::spawn_blocking(move || prepare_document(path)).await {
+                    Ok(result) => result,
+                    Err(_) => Err("DOCUMENT_OPEN_FAILED".to_string()),
+                };
+            publish_import_result(&app_handle, operation, started_published, prepared);
+            app_handle
+                .state::<Mutex<DocumentRegistry>>()
+                .lock()
+                .expect("document registry")
+                .finish_import_slot();
+            drive_import_queue(&app_handle);
+        });
+    }
+}
+
+fn publish_document(app: &AppHandle, path: PathBuf) {
+    let (operation, frontend_ready) = app
         .state::<Mutex<DocumentRegistry>>()
         .lock()
         .expect("document registry")
-        .open_document(path);
-    let payload = match result {
-        Ok(payload) => payload,
-        Err(code) => {
-            let _ = app.emit(
-                "document-error",
-                DocumentErrorEvent {
-                    document_id: None,
-                    code,
-                },
-            );
-            return;
-        }
+        .begin_import(&path);
+    let started_published = frontend_ready
+        && app
+            .emit("document-import-started", operation.clone())
+            .is_ok();
+    let job = ImportJob {
+        operation: operation.clone(),
+        path,
+        started_published,
     };
-    let registry_state = app.state::<Mutex<DocumentRegistry>>();
-    let mut registry = registry_state.lock().expect("document registry");
-    if queue_if_needed || !registry.frontend_ready {
-        registry.queue_document(payload);
-    } else if app.emit("document-opened", payload.clone()).is_err() {
-        registry.close_document(&payload.document_id);
+    let admission = app
+        .state::<Mutex<DocumentRegistry>>()
+        .lock()
+        .expect("document registry")
+        .enqueue_import(job);
+    if let Err(code) = admission {
+        publish_import_result(app, operation, started_published, Err(code));
+        return;
     }
+    drive_import_queue(app);
 }
 
 #[tauri::command]
@@ -847,7 +1272,7 @@ fn open_document_dialog(window: WebviewWindow) {
         .pick_file(move |file| {
             if let Some(file) = file {
                 if let Ok(path) = file.into_path() {
-                    publish_document(&app, path, false);
+                    publish_document(&app, path);
                 }
             }
         });
@@ -980,10 +1405,11 @@ async fn export_png_dialog(
 }
 
 #[tauri::command]
-fn take_pending_document(registry: State<'_, Mutex<DocumentRegistry>>) -> Option<DocumentPayload> {
-    let mut registry = registry.lock().expect("document registry");
-    registry.frontend_ready = true;
-    registry.pending.take()
+fn take_pending_import(registry: State<'_, Mutex<DocumentRegistry>>) -> Option<PendingImport> {
+    registry
+        .lock()
+        .expect("document registry")
+        .take_pending_import()
 }
 
 #[tauri::command]
@@ -1004,16 +1430,54 @@ fn reload_document(
 }
 
 #[tauri::command]
-fn resolve_image_source(
+async fn resolve_image_source(
+    app: AppHandle,
     document_id: String,
     source: String,
     allow_remote: bool,
-    registry: State<'_, Mutex<DocumentRegistry>>,
 ) -> Result<ResolvedImageSource, String> {
-    registry
-        .lock()
-        .expect("document registry")
-        .resolve_image(&document_id, &source, allow_remote)
+    match classify_image_source(&source) {
+        ImageSourceClass::Https(url) => {
+            if allow_remote {
+                Ok(ResolvedImageSource { url })
+            } else {
+                Err("IMAGE_REMOTE_BLOCKED".to_string())
+            }
+        }
+        ImageSourceClass::Rejected(error) => Err(error),
+        ImageSourceClass::Local(source) => {
+            let resolution = app
+                .state::<Mutex<DocumentRegistry>>()
+                .lock()
+                .expect("document registry")
+                .local_image_resolution(&document_id, &source)?;
+            if let Some(url) = resolution.cached_url {
+                return Ok(ResolvedImageSource { url });
+            }
+
+            let LocalImageResolution { identity, root, .. } = resolution;
+            let preparation_identity = identity.clone();
+            let prepared = tauri::async_runtime::spawn_blocking(move || {
+                prepare_local_image(&root, &preparation_identity)
+            })
+            .await
+            .map_err(|_| "IMAGE_READ_FAILED".to_string())??;
+            app.state::<Mutex<DocumentRegistry>>()
+                .lock()
+                .expect("document registry")
+                .store_prepared_image(&document_id, identity, prepared)
+        }
+        ImageSourceClass::Data(source) => {
+            let (identity, prepared) =
+                tauri::async_runtime::spawn_blocking(move || prepare_data_image(&source))
+                    .await
+                    .map_err(|_| "IMAGE_DATA_INVALID".to_string())??;
+            app.state::<Mutex<DocumentRegistry>>()
+                .lock()
+                .expect("document registry")
+                .store_prepared_image(&document_id, identity, prepared)
+        }
+    }
 }
 
 fn normalize_external_url(url: &str) -> Result<String, String> {
@@ -1154,6 +1618,140 @@ fn stop_document_watch() {
 #[cfg(test)]
 mod local_image_tests {
     use super::*;
+
+    #[test]
+    fn import_coordinator_bounds_queue_active_work_and_source_reservations() {
+        let mut registry = DocumentRegistry::default();
+        for sequence in 0..MAX_IMPORT_OPERATIONS {
+            registry
+                .enqueue_import(ImportJob::for_test(sequence as u64))
+                .expect("operation within queue bound");
+        }
+        assert!(matches!(
+            registry.enqueue_import(ImportJob::for_test(MAX_IMPORT_OPERATIONS as u64)),
+            Err(error) if error == "DOCUMENT_TAB_LIMIT"
+        ));
+
+        let active = (0..MAX_ACTIVE_IMPORTS)
+            .map(|_| registry.start_next_import().expect("active import slot"))
+            .collect::<Vec<_>>();
+        assert!(registry.start_next_import().is_none());
+        assert_eq!(registry.active_imports, MAX_ACTIVE_IMPORTS);
+        assert_eq!(
+            registry.import_reserved_bytes,
+            MAX_ACTIVE_IMPORTS * MAX_DOCUMENT_INPUT_BYTES
+        );
+
+        for _job in active {
+            registry.finish_import_slot();
+        }
+        assert_eq!(registry.active_imports, 0);
+        assert_eq!(registry.import_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn import_coordinator_releases_failed_slots_before_admitting_the_next_job() {
+        let mut registry = DocumentRegistry::default();
+        let active = (0..MAX_ACTIVE_IMPORTS)
+            .map(|sequence| {
+                registry
+                    .enqueue_import(ImportJob::for_test(sequence as u64))
+                    .expect("initial job is admitted");
+                registry.start_next_import().expect("initial job starts")
+            })
+            .collect::<Vec<_>>();
+
+        for (index, code) in [
+            "DOCUMENT_OPEN_FAILED",
+            "DOCUMENT_TAB_LIMIT",
+            "DOCUMENT_OPEN_FAILED",
+            "DOCUMENT_OPEN_FAILED",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let failed = &active[index];
+            let terminal = PendingImport::error(failed.operation.clone(), (*code).to_string());
+            assert_eq!(terminal.kind, "error");
+            assert_eq!(terminal.code.as_deref(), Some(*code));
+
+            let replacement_sequence = (MAX_ACTIVE_IMPORTS + index) as u64;
+            registry
+                .enqueue_import(ImportJob::for_test(replacement_sequence))
+                .expect("replacement waits for the freed slot");
+            registry.finish_import_slot();
+            let replacement = registry
+                .start_next_import()
+                .expect("failed work releases a slot for the next job");
+            assert_eq!(replacement.operation.sequence, replacement_sequence);
+            assert_eq!(registry.active_imports, MAX_ACTIVE_IMPORTS);
+            assert_eq!(
+                registry.import_reserved_bytes,
+                MAX_ACTIVE_IMPORTS * MAX_DOCUMENT_INPUT_BYTES
+            );
+        }
+
+        for _ in 0..MAX_ACTIVE_IMPORTS {
+            registry.finish_import_slot();
+        }
+        assert_eq!(registry.active_imports, 0);
+        assert_eq!(registry.import_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn taking_a_pending_error_marks_the_frontend_ready_without_retaining_a_context() {
+        let mut registry = DocumentRegistry::default();
+        registry.queue_pending_import(PendingImport::error(
+            DocumentImportOperation::for_test("failed-startup", 1, "failed.md"),
+            "DOCUMENT_OPEN_FAILED".to_string(),
+        ));
+
+        let pending = registry
+            .take_pending_import()
+            .expect("pending error is returned once");
+        assert!(registry.frontend_ready);
+        assert_eq!(pending.kind, "error");
+        assert_eq!(pending.code.as_deref(), Some("DOCUMENT_OPEN_FAILED"));
+        assert!(pending.document.is_none());
+        assert!(registry.pending_import.is_none());
+        assert!(registry.documents.is_empty());
+    }
+
+    #[test]
+    fn import_file_labels_never_expose_directories_or_control_characters() {
+        let path = PathBuf::from("/private/customer/\u{202e} report\n\t.md");
+        let label = safe_file_label(&path);
+        assert_eq!(label, "report .md");
+        assert!(!label.contains("private"));
+        assert!(label.chars().count() <= 120);
+    }
+
+    #[test]
+    fn import_and_watcher_errors_keep_distinct_public_event_schemas() {
+        let import = serde_json::to_value(DocumentImportErrorEvent {
+            operation_id: "operation".to_string(),
+            sequence: 7,
+            code: "DOCUMENT_OPEN_FAILED".to_string(),
+        })
+        .expect("serialize import error");
+        let watcher = serde_json::to_value(DocumentErrorEvent {
+            document_id: Some("document".to_string()),
+            code: "DOCUMENT_READ_FAILED".to_string(),
+        })
+        .expect("serialize watcher error");
+
+        assert_eq!(
+            import.get("operationId").and_then(|value| value.as_str()),
+            Some("operation")
+        );
+        assert!(import.get("documentId").is_none());
+        assert_eq!(
+            watcher.get("documentId").and_then(|value| value.as_str()),
+            Some("document")
+        );
+        assert!(watcher.get("operationId").is_none());
+    }
+
     #[test]
     fn rejects_escaped_and_nonlocal_paths() {
         assert_eq!(
@@ -1189,6 +1787,10 @@ mod local_image_tests {
                 revision: 0,
                 resources: HashMap::new(),
                 resource_bytes: 0,
+                creator_operation_id: "test".to_string(),
+                published: true,
+                claims: HashSet::new(),
+                pending_owner_count: 0,
             },
         );
         let source = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxIiBoZWlnaHQ9IjEiPjxyZWN0IHdpZHRoPSIxIiBoZWlnaHQ9IjEiLz48L3N2Zz4=";
@@ -1249,9 +1851,11 @@ mod local_image_tests {
     }
 
     #[test]
-    fn safe_svg_rasterization_loads_available_system_fonts() {
-        let mut options = safe_svg_options();
-        assert!(options.fontdb_mut().faces().next().is_some());
+    fn safe_svg_rasterization_reuses_one_available_system_font_database() {
+        let first = safe_svg_options();
+        let second = safe_svg_options();
+        assert!(first.fontdb.faces().next().is_some());
+        assert!(Arc::ptr_eq(&first.fontdb, &second.fontdb));
     }
 
     #[test]
@@ -1318,22 +1922,136 @@ mod local_image_tests {
     }
 
     #[test]
+    fn the_last_failed_claim_reaps_an_unpublished_reused_context() {
+        let directory =
+            std::env::temp_dir().join(format!("mdreader-claim-reap-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("test directory");
+        let document = directory.join("document.md");
+        fs::write(&document, "# claims").expect("test markdown");
+
+        let mut registry = DocumentRegistry::default();
+        let created = registry
+            .commit_prepared(
+                prepare_document(document.clone()).expect("prepare creator"),
+                "creator",
+            )
+            .expect("create claim");
+        let reused = registry
+            .commit_prepared(prepare_document(document).expect("prepare reuse"), "reuser")
+            .expect("reuse claim");
+        assert_eq!(created.document_id, reused.document_id);
+
+        registry.release_claim(&created.document_id, "creator");
+        assert!(registry.documents.contains_key(&created.document_id));
+        registry.release_claim(&reused.document_id, "reuser");
+        assert!(!registry.documents.contains_key(&created.document_id));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn replacing_pending_with_a_reused_claim_keeps_the_shared_context_alive() {
+        let directory =
+            std::env::temp_dir().join(format!("mdreader-pending-reuse-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("test directory");
+        let document = directory.join("document.md");
+        fs::write(&document, "# pending reuse").expect("test markdown");
+        let mut registry = DocumentRegistry::default();
+
+        let creator_operation = DocumentImportOperation::for_test("creator", 1, "document.md");
+        let created = registry
+            .commit_prepared(
+                prepare_document(document.clone()).expect("prepare creator"),
+                &creator_operation.operation_id,
+            )
+            .expect("create claim");
+        registry.queue_pending_import(PendingImport::opened(creator_operation, created.clone()));
+
+        let reuse_operation = DocumentImportOperation::for_test("reuser", 2, "document.md");
+        let reused = registry
+            .commit_prepared(
+                prepare_document(document).expect("prepare reuse"),
+                &reuse_operation.operation_id,
+            )
+            .expect("reuse claim");
+        registry.queue_pending_import(PendingImport::opened(reuse_operation, reused));
+
+        assert!(registry.documents.contains_key(&created.document_id));
+        assert_eq!(
+            registry
+                .pending_import
+                .as_ref()
+                .and_then(PendingImport::document_id),
+            Some(created.document_id.as_str())
+        );
+        registry.take_pending_import();
+        assert!(registry
+            .documents
+            .get(&created.document_id)
+            .is_some_and(|context| context.published));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn enforces_the_open_document_limit() {
         let directory =
             std::env::temp_dir().join(format!("mdreader-tab-limit-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).expect("test directory");
         let mut registry = DocumentRegistry::default();
+        let first_path = directory.join("document-0.md");
+        let mut first_document_id = String::new();
         for index in 0..MAX_OPEN_DOCUMENTS {
             let path = directory.join(format!("document-{index}.md"));
             fs::write(&path, "# document").expect("test markdown");
-            registry.open_document(path).expect("within tab limit");
+            let opened = registry.open_document(path).expect("within tab limit");
+            if index == 0 {
+                first_document_id = opened.document_id;
+            }
         }
+        let duplicate = registry
+            .open_document(first_path)
+            .expect("duplicate remains valid at unique-context capacity");
+        assert_eq!(duplicate.document_id, first_document_id);
         let rejected = directory.join("document-over-limit.md");
         fs::write(&rejected, "# document").expect("test markdown");
         assert!(matches!(
             registry.open_document(rejected),
             Err(error) if error == "DOCUMENT_TAB_LIMIT"
         ));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn concurrent_duplicate_commits_reuse_one_of_thirty_one_contexts() {
+        let directory = std::env::temp_dir().join(format!(
+            "mdreader-concurrent-duplicate-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let mut registry = DocumentRegistry::default();
+        let duplicate_path = directory.join("document-0.md");
+        let mut original_id = String::new();
+        for index in 0..31 {
+            let path = directory.join(format!("document-{index}.md"));
+            fs::write(&path, "# document").expect("test markdown");
+            let opened = registry.open_document(path).expect("within tab limit");
+            if index == 0 {
+                original_id = opened.document_id;
+            }
+        }
+
+        let first_prepared = prepare_document(duplicate_path.clone()).expect("first prepare");
+        let second_prepared = prepare_document(duplicate_path).expect("second prepare");
+        let first = registry
+            .commit_prepared(first_prepared, "duplicate-one")
+            .expect("first duplicate claim");
+        let second = registry
+            .commit_prepared(second_prepared, "duplicate-two")
+            .expect("second duplicate claim");
+        assert_eq!(first.document_id, original_id);
+        assert_eq!(second.document_id, original_id);
+        assert_eq!(registry.documents.len(), 31);
+        registry.publish_claim(&first.document_id, "duplicate-one");
+        registry.publish_claim(&second.document_id, "duplicate-two");
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -1415,6 +2133,10 @@ mod local_image_tests {
                 revision: 0,
                 resources: HashMap::new(),
                 resource_bytes: 0,
+                creator_operation_id: "test".to_string(),
+                published: true,
+                claims: HashSet::new(),
+                pending_owner_count: 0,
             },
         );
         registry.close_document("doc");
@@ -1433,6 +2155,10 @@ mod local_image_tests {
                 revision: 0,
                 resources: HashMap::new(),
                 resource_bytes: 0,
+                creator_operation_id: "test".to_string(),
+                published: true,
+                claims: HashSet::new(),
+                pending_owner_count: 0,
             },
         );
         assert_eq!(
@@ -1459,27 +2185,37 @@ mod local_image_tests {
                     revision: 0,
                     resources: HashMap::new(),
                     resource_bytes: 0,
+                    creator_operation_id: id.to_string(),
+                    published: false,
+                    claims: HashSet::new(),
+                    pending_owner_count: 0,
                 },
             );
         }
-        registry.queue_document(DocumentPayload {
-            document_id: "first".to_string(),
-            file_name: "first.md".to_string(),
-            content: String::new(),
-            source_revision: 0,
-        });
-        registry.queue_document(DocumentPayload {
-            document_id: "second".to_string(),
-            file_name: "second.md".to_string(),
-            content: String::new(),
-            source_revision: 0,
-        });
+        registry.queue_pending_import(PendingImport::opened(
+            DocumentImportOperation::for_test("first", 1, "first.md"),
+            DocumentPayload {
+                document_id: "first".to_string(),
+                file_name: "first.md".to_string(),
+                content: String::new(),
+                source_revision: 0,
+            },
+        ));
+        registry.queue_pending_import(PendingImport::opened(
+            DocumentImportOperation::for_test("second", 2, "second.md"),
+            DocumentPayload {
+                document_id: "second".to_string(),
+                file_name: "second.md".to_string(),
+                content: String::new(),
+                source_revision: 0,
+            },
+        ));
         assert!(!registry.documents.contains_key("first"));
         assert_eq!(
             registry
-                .pending
+                .pending_import
                 .as_ref()
-                .map(|payload| payload.document_id.as_str()),
+                .and_then(PendingImport::document_id),
             Some("second")
         );
     }
@@ -1522,6 +2258,43 @@ mod local_image_tests {
             serve_image(&registry, path).status(),
             http::StatusCode::NOT_FOUND
         );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn prepares_a_local_image_before_relocking_the_registry_to_commit_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "mdreader-image-preparation-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let document_path = directory.join("document.md");
+        let image_path = directory.join("image.svg");
+        fs::write(&document_path, "![local](image.svg)").expect("test markdown");
+        fs::write(
+            &image_path,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\" /></svg>",
+        )
+        .expect("test image");
+
+        let mut registry = DocumentRegistry::default();
+        let document = registry
+            .open_document(document_path)
+            .expect("open document");
+        let resolution = registry
+            .local_image_resolution(&document.document_id, "image.svg")
+            .expect("resolve local image");
+        assert!(resolution.cached_url.is_none());
+
+        let prepared = prepare_local_image(&resolution.root, &resolution.identity)
+            .expect("prepare image without the registry");
+        assert_eq!(registry.total_resources, 0);
+        let resolved = registry
+            .store_prepared_image(&document.document_id, resolution.identity, prepared)
+            .expect("commit prepared image");
+
+        assert!(resolved.url.starts_with("mdreader-image://localhost/"));
+        assert_eq!(registry.total_resources, 1);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -1794,7 +2567,7 @@ pub fn run() {
                 .map(PathBuf::from)
                 .find(|path| is_supported_file(path))
             {
-                publish_document(app, path, false);
+                publish_document(app, path);
             }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
@@ -1807,7 +2580,7 @@ pub fn run() {
                 .map(PathBuf::from)
                 .find(|path| is_supported_file(path))
             {
-                publish_document(app.handle(), path, true);
+                publish_document(app.handle(), path);
             }
             Ok(())
         })
@@ -1823,7 +2596,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 if let Some(path) = paths.iter().find(|path| is_supported_file(path)) {
-                    publish_document(window.app_handle(), path.clone(), false);
+                    publish_document(window.app_handle(), path.clone());
                 }
             }
         })
@@ -1833,7 +2606,7 @@ pub fn run() {
             set_menu_locale,
             export_png_dialog,
             open_external_url,
-            take_pending_document,
+            take_pending_import,
             reload_document,
             resolve_image_source,
             close_document,
@@ -1849,7 +2622,7 @@ pub fn run() {
                     .find_map(|url| url.to_file_path().ok())
                     .filter(|path| is_supported_file(path))
                 {
-                    publish_document(app, path, false);
+                    publish_document(app, path);
                 }
             }
         });

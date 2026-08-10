@@ -8,7 +8,7 @@ type RenderRequest = {
 }
 
 type RenderResponse =
-  | { type: 'rendered'; requestId: string; documentKey: string; document: RenderDocument }
+  | { type: 'rendered'; requestId: string; documentKey: string; document: RenderDocument; serializedBytes: number }
   | { type: 'failed'; requestId: string; documentKey: string; code: string }
 
 type WorkerScope = {
@@ -42,6 +42,7 @@ workerScope.onmessage = async ({ data }) => {
       requestId: data.requestId,
       documentKey: data.documentKey,
       document,
+      serializedBytes: new TextEncoder().encode(JSON.stringify(document)).byteLength,
     })
   } catch {
     if (latestRequestByDocument.get(data.documentKey) !== data.requestId) {

@@ -4,13 +4,14 @@
 
 ## 当前状态
 
-项目已完成 v0.1 开源前整改和本地跨层验证，当前提供可安装的 unsigned macOS Release Candidate；尚未发布正式 GitHub Release。源码、测试、依赖审计和 unsigned macOS Release workflow 已就绪，正式 Release 仍需由维护者在具备 GitHub 权限的仓库中打 tag 后生成。
+当前版本为 v1.0。源码、测试、依赖审计和 unsigned macOS Release workflow 已就绪；推送 `v1.0.0` 标签后，GitHub Releases 会提供可安装的 macOS 包、校验和与构建来源。
 
-v0.1 完成后将优先提供：
+v1.0 提供：
 
 - macOS unsigned 可安装产物，用户无需自行构建。
 - GFM、脚注、GitHub Alerts、KaTeX、代码高亮和受限 Mermaid。
-- 长文档搜索、H1-H4 目录、稳定锚点、多标签和独立文件刷新。
+- 长文档搜索、H1-H4 目录、稳定锚点、多标签和独立文件刷新；标签会先缩窄至可读宽度，再收进“更多”菜单。
+- 空白状态也可直接使用右上角的打开、主题和设置入口；设置会沿用到随后打开的文档。
 - 本地图片安全加载，HTTPS 远程图片默认阻断并按当前标签临时授权。
 - MIT License、自动测试、依赖审计、校验和和可追溯 GitHub Release。
 
@@ -66,9 +67,7 @@ bash scripts/build-unsigned-dmg.sh
 
 ## 安装包
 
-完成 v0.1 验收后，GitHub Releases workflow 将在维护者推送版本 tag 时提供 unsigned macOS 安装产物、SHA-256 和构建来源。由于不使用 Apple Developer ID 签名或公证，macOS 可能显示 Gatekeeper 提示；Release 说明会提供明确的校验和手动安装步骤，详见 [`docs/release/UNSIGNED_MACOS.md`](docs/release/UNSIGNED_MACOS.md)。
-
-在首个 Release 出现之前，不存在官方预构建下载。
+GitHub Releases workflow 会在推送 `v1.0.0` 这类版本标签时提供 unsigned macOS 安装产物、SHA-256 和构建来源。由于不使用 Apple Developer ID 签名或公证，macOS 可能显示 Gatekeeper 提示；Release 说明会提供明确的校验和手动安装步骤，详见 [`docs/release/UNSIGNED_MACOS.md`](docs/release/UNSIGNED_MACOS.md)。
 
 ## 贡献
 

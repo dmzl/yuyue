@@ -2,8 +2,13 @@ import type { RenderDocument } from './renderer'
 import RenderWorker from './worker?worker'
 
 type RenderResponse =
-  | { type: 'rendered'; requestId: string; documentKey: string; document: RenderDocument }
+  | { type: 'rendered'; requestId: string; documentKey: string; document: unknown; serializedBytes: unknown }
   | { type: 'failed'; requestId: string; documentKey: string; code: string }
+
+export interface RenderResult {
+  document: RenderDocument
+  serializedBytes: number
+}
 
 type PendingRender = {
   documentKey: string
@@ -11,11 +16,94 @@ type PendingRender = {
   sourceBytes: number
   priority: number
   sequence: number
-  resolve: (document: RenderDocument) => void
+  resolve: (result: RenderResult) => void
   reject: (error: RenderWorkerError) => void
 }
 
 const MAX_PENDING_SOURCE_BYTES = 64 * 1024 * 1024
+const MAX_RENDER_RESULT_BYTES = 128 * 1024 * 1024
+const MAX_RENDER_COLLECTION_ITEMS = 200_000
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isBoundedString(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= MAX_RENDER_RESULT_BYTES
+}
+
+function isBoundedArray(value: unknown): value is unknown[] {
+  return Array.isArray(value) && value.length <= MAX_RENDER_COLLECTION_ITEMS
+}
+
+function isNonNegativeSafeInteger(value: unknown, maximum = MAX_RENDER_RESULT_BYTES): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= maximum
+}
+
+function isSourcePosition(value: unknown) {
+  if (value === undefined) return true
+  if (!isRecord(value)) return false
+  const start = value.start
+  const end = value.end
+  return isNonNegativeSafeInteger(start) && isNonNegativeSafeInteger(end) && start <= end
+}
+
+function isRenderDocument(value: unknown): value is RenderDocument {
+  if (!isRecord(value) ||
+    !isBoundedString(value.html) ||
+    !isBoundedArray(value.outline) ||
+    !isBoundedArray(value.resources) ||
+    !isBoundedArray(value.links) ||
+    !isBoundedArray(value.diagrams) ||
+    !isBoundedArray(value.diagnostics) ||
+    !isRecord(value.stats)) return false
+
+  const outlineValid = value.outline.every((item) => {
+    if (!isRecord(item)) return false
+    const level = item.level
+    return isBoundedString(item.id) &&
+      isBoundedString(item.text) &&
+      isNonNegativeSafeInteger(level, 6) &&
+      level >= 1 &&
+      isSourcePosition(item.sourcePosition)
+  })
+  const resourcesValid = value.resources.every((item) => isRecord(item) &&
+    isBoundedString(item.id) &&
+    (item.kind === 'local' || item.kind === 'https' || item.kind === 'data' || item.kind === 'blocked') &&
+    isBoundedString(item.source) &&
+    isBoundedString(item.alt) &&
+    (item.title === undefined || isBoundedString(item.title)))
+  const linksValid = value.links.every((item) => isRecord(item) &&
+    isBoundedString(item.id) &&
+    (item.kind === 'internal' || item.kind === 'external' || item.kind === 'blocked') &&
+    isBoundedString(item.url) &&
+    isBoundedString(item.text))
+  const diagramsValid = value.diagrams.every((item) => isRecord(item) &&
+    isBoundedString(item.id) &&
+    isBoundedString(item.source) &&
+    (item.error === undefined || item.error === 'MERMAID_LIMIT'))
+  const diagnosticsValid = value.diagnostics.every((item) => isRecord(item) &&
+    isBoundedString(item.code) &&
+    (item.severity === 'info' || item.severity === 'warning' || item.severity === 'error') &&
+    isBoundedString(item.message) &&
+    isSourcePosition(item.sourcePosition))
+  const stats = value.stats
+  const statsValid = isNonNegativeSafeInteger(stats.inputBytes) &&
+    isNonNegativeSafeInteger(stats.astNodes, MAX_RENDER_COLLECTION_ITEMS) &&
+    stats.headingCount === value.outline.length &&
+    stats.diagramCount === value.diagrams.length
+
+  return outlineValid && resourcesValid && linksValid && diagramsValid && diagnosticsValid && statsValid
+}
+
+function isRenderResponse(value: unknown): value is RenderResponse {
+  if (!isRecord(value) ||
+    (value.type !== 'rendered' && value.type !== 'failed') ||
+    typeof value.requestId !== 'string' ||
+    typeof value.documentKey !== 'string') return false
+  if (value.type === 'rendered') return 'document' in value && 'serializedBytes' in value
+  return typeof value.code === 'string'
+}
 
 export class RenderWorkerError extends Error {
   constructor(public readonly code: string) {
@@ -40,7 +128,17 @@ export class RenderWorkerSupervisor {
     private readonly maxPendingSourceBytes = MAX_PENDING_SOURCE_BYTES,
   ) {}
 
-  render(source: string, documentKey: string, priority = 0): Promise<RenderDocument> {
+  prepare(): boolean {
+    try {
+      this.ensureWorker()
+      return true
+    } catch {
+      this.worker = null
+      return false
+    }
+  }
+
+  render(source: string, documentKey: string, priority = 0): Promise<RenderResult> {
     const sourceBytes = new TextEncoder().encode(source).byteLength
     const previousRequestId = this.latestByDocument.get(documentKey)
     const previous = previousRequestId ? this.pending.get(previousRequestId) : undefined
@@ -64,7 +162,7 @@ export class RenderWorkerSupervisor {
     }
     this.latestByDocument.set(documentKey, requestId)
 
-    return new Promise<RenderDocument>((resolve, reject) => {
+    return new Promise<RenderResult>((resolve, reject) => {
       this.pending.set(requestId, {
         documentKey,
         source,
@@ -98,17 +196,11 @@ export class RenderWorkerSupervisor {
     if (this.worker) return this.worker
     const epoch = this.epoch
     const worker = this.workerFactory()
-    worker.onmessage = (event: MessageEvent<RenderResponse>) => {
+    worker.onmessage = (event: MessageEvent<unknown>) => {
       if (epoch !== this.epoch) return
       const response = event.data
-      if (
-        !response ||
-        typeof response !== 'object' ||
-        (response.type !== 'rendered' && response.type !== 'failed') ||
-        typeof response.requestId !== 'string' ||
-        typeof response.documentKey !== 'string'
-      ) {
-        this.restartWorker()
+      if (!isRenderResponse(response)) {
+        this.restartWorker(new RenderWorkerError('RENDER_PROTOCOL_ERROR'))
         return
       }
       const pending = this.pending.get(response.requestId)
@@ -129,6 +221,16 @@ export class RenderWorkerSupervisor {
         this.restartWorker()
         return
       }
+      let rendered: RenderResult | undefined
+      if (response.type === 'rendered') {
+        if (!isNonNegativeSafeInteger(response.serializedBytes) || !isRenderDocument(response.document)) {
+          this.rejectPending(response.requestId, new RenderWorkerError('RENDER_PROTOCOL_ERROR'))
+          if (this.inFlight === response.requestId) this.inFlight = null
+          this.restartWorker()
+          return
+        }
+        rendered = { document: response.document, serializedBytes: response.serializedBytes }
+      }
       this.pending.delete(response.requestId)
       this.pendingSourceBytes = Math.max(0, this.pendingSourceBytes - pending.sourceBytes)
       if (this.inFlight === response.requestId) this.inFlight = null
@@ -136,7 +238,7 @@ export class RenderWorkerSupervisor {
         this.latestByDocument.delete(pending.documentKey)
       }
       if (response.type === 'rendered') {
-        pending.resolve(response.document)
+        pending.resolve(rendered as RenderResult)
       } else {
         pending.reject(new RenderWorkerError(response.code))
       }
@@ -195,9 +297,9 @@ export class RenderWorkerSupervisor {
     this.executionTimeouts.set(requestId, timeout)
   }
 
-  private restartWorker() {
+  private restartWorker(error = new RenderWorkerError('RENDER_WORKER_RESTARTED')) {
     this.epoch += 1
-    this.rejectAll(new RenderWorkerError('RENDER_WORKER_RESTARTED'))
+    this.rejectAll(error)
     this.worker?.terminate()
     this.worker = null
   }

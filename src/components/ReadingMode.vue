@@ -5,7 +5,6 @@ import type { RenderDocument, RenderLink, RenderResource } from '../markdown/ren
 import { gateMermaidSource, sanitizeMermaidSvg } from '../markdown/mermaid'
 import MediaLightbox, { type LightboxMedia } from './MediaLightbox.vue'
 import ReaderSearch from './ReaderSearch.vue'
-import ReaderSettings from './ReaderSettings.vue'
 import { useLocale } from '../composables/useLocale'
 
 const props = withDefaults(defineProps<{
@@ -15,19 +14,25 @@ const props = withDefaults(defineProps<{
   active: boolean
   initialScrollRatio: number
   remoteImageAuthorized: boolean
+  renderGeneration?: number
+  paintOperationId?: string
   errorMessage?: string
+  fontScale?: number
+  contentWidth?: 'comfortable' | 'wide'
   settingsOpen?: boolean
-}>(), { errorMessage: '', settingsOpen: false })
+}>(), { renderGeneration: 0, paintOperationId: '', errorMessage: '', fontScale: 1, contentWidth: 'comfortable', settingsOpen: false })
 
 const emit = defineEmits<{
   'scroll-ratio': [ratio: number]
   'authorize-remote-images': []
   'update-settings-open': [open: boolean]
+  'content-painted': [operationId: string, documentId: string, generation: number]
   retry: []
 }>()
 
 const MERMAID_AUTO_BUDGET_MS = 2_000
 const MERMAID_DIAGRAM_TIMEOUT_MS = 8_000
+const RESOURCE_PRELOAD_MARGIN = '640px 0px'
 
 const previewRef = useTemplateRef<HTMLElement>('preview')
 const catalogSidebarRef = useTemplateRef<HTMLElement>('catalog')
@@ -38,15 +43,15 @@ const searchMatchIndex = shallowRef(0)
 const searchOpen = shallowRef(false)
 const activeHeadingId = shallowRef('')
 const isReady = shallowRef(false)
-const fontScale = shallowRef(1)
-const contentWidth = shallowRef<'comfortable' | 'wide'>('comfortable')
 const statusMessage = shallowRef('')
 const enlargedMedia = shallowRef<LightboxMedia | null>(null)
 const hydrationGeneration = shallowRef(0)
+const lastPaintAcknowledgement = shallowRef('')
 const mermaidCleanups: Array<() => void> = []
+type ResourceObserverSession = { disconnect: () => void }
+let resourceObserver: ResourceObserverSession | undefined
 const { currentLocale, t } = useLocale()
 
-const remoteImageCount = computed(() => props.document.resources.filter((resource) => resource.kind === 'https').length)
 const diagnosticMessage = computed(() => {
   const first = props.document.diagnostics[0]
   if (!first) return ''
@@ -176,6 +181,11 @@ function clearMermaidListeners() {
   while (mermaidCleanups.length > 0) mermaidCleanups.pop()?.()
 }
 
+function clearResourceObserver() {
+  resourceObserver?.disconnect()
+  resourceObserver = undefined
+}
+
 async function copyToClipboard(value: string) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value)
@@ -207,27 +217,54 @@ function decorateCodeBlocks() {
     label.className = 'code-language'
     const languageClass = Array.from(code.classList).find((name) => name.startsWith('language-'))
     label.textContent = languageClass ? t('codeLanguage', { language: languageClass.slice('language-'.length) }) : t('code')
+    const copyActions = document.createElement('span')
+    copyActions.className = 'code-copy-actions'
     const button = document.createElement('button')
+    const copyIcon = '<svg data-icon="copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="11" rx="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></svg>'
+    const copiedIcon = '<svg data-icon="check" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>'
+    let feedbackTimer: ReturnType<typeof window.setTimeout> | undefined
+    const resetCopyFeedback = () => {
+      if (feedbackTimer !== undefined) {
+        window.clearTimeout(feedbackTimer)
+        feedbackTimer = undefined
+      }
+      delete button.dataset.copied
+      button.setAttribute('aria-label', t('copyCode'))
+      button.title = t('copyCode')
+      button.innerHTML = copyIcon
+      copyActions.querySelector('.code-copy-feedback')?.remove()
+    }
     button.type = 'button'
     button.className = 'code-copy-button'
     button.setAttribute('aria-label', t('copyCode'))
     button.title = t('copyCode')
-    button.innerHTML = '<svg data-icon="copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="11" rx="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></svg>'
+    button.innerHTML = copyIcon
     button.addEventListener('click', async () => {
       try {
         await copyToClipboard(code.textContent ?? '')
+        statusMessage.value = ''
+        resetCopyFeedback()
         button.dataset.copied = 'true'
-        button.title = t('copied')
-        statusMessage.value = t('codeCopied')
-        window.setTimeout(() => {
-          delete button.dataset.copied
-          button.title = t('copyCode')
+        button.setAttribute('aria-label', t('codeCopied'))
+        button.title = t('codeCopied')
+        button.innerHTML = copiedIcon
+        copyActions.querySelector('.code-copy-feedback')?.remove()
+        const feedback = document.createElement('span')
+        feedback.className = 'code-copy-feedback'
+        feedback.setAttribute('role', 'status')
+        feedback.setAttribute('aria-live', 'polite')
+        feedback.textContent = t('codeCopied')
+        copyActions.append(feedback)
+        feedbackTimer = window.setTimeout(() => {
+          resetCopyFeedback()
         }, 1_500)
       } catch {
+        resetCopyFeedback()
         statusMessage.value = t('copyCodeFailed')
       }
     })
-    toolbar.append(label, button)
+    copyActions.append(button)
+    toolbar.append(label, copyActions)
     pre.parentElement?.insertBefore(toolbar, pre)
   }
 }
@@ -413,21 +450,92 @@ async function hydrateMermaidDiagrams(generation: number, startIndex = 0) {
   }
 }
 
+async function hydrateResources(generation: number) {
+  const container = previewRef.value
+  if (!container || generation !== hydrationGeneration.value) return
+  clearResourceObserver()
+
+  const ResourceObserver = window.IntersectionObserver
+  if (!ResourceObserver) {
+    for (const resource of props.document.resources) {
+      await hydrateResource(resource, generation)
+      if (generation !== hydrationGeneration.value) return
+    }
+    return
+  }
+
+  const resourcesByPlaceholder = new Map<Element, RenderResource>()
+  let session: ResourceObserverSession | undefined
+  const observer = new ResourceObserver((entries) => {
+    if (generation !== hydrationGeneration.value || resourceObserver !== session) return
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue
+      const resource = resourcesByPlaceholder.get(entry.target)
+      observer.unobserve(entry.target)
+      resourcesByPlaceholder.delete(entry.target)
+      if (resource) void hydrateResource(resource, generation)
+    }
+  }, {
+    root: container,
+    rootMargin: RESOURCE_PRELOAD_MARGIN,
+    threshold: 0,
+  })
+  session = {
+    disconnect() {
+      observer.disconnect()
+      resourcesByPlaceholder.clear()
+    },
+  }
+  resourceObserver = session
+
+  for (const resource of props.document.resources) {
+    if (generation !== hydrationGeneration.value) return
+    const placeholder = container.querySelector(`[data-md-resource-id="${resource.id}"]`)
+    if (!placeholder) continue
+    resourcesByPlaceholder.set(placeholder, resource)
+    observer.observe(placeholder)
+  }
+}
+
+async function hydrateDeferredContent(generation: number) {
+  const container = previewRef.value
+  if (!container || generation !== hydrationGeneration.value) return
+  container.querySelectorAll('.mermaid-deferred').forEach((notice) => notice.remove())
+  decorateCodeBlocks()
+  await hydrateResources(generation)
+  if (generation !== hydrationGeneration.value) return
+  await hydrateMermaidDiagrams(generation)
+}
+
 async function hydrateContent() {
   const generation = hydrationGeneration.value + 1
   hydrationGeneration.value = generation
   clearMermaidListeners()
+  clearResourceObserver()
   await nextTick()
   if (!previewRef.value || generation !== hydrationGeneration.value) return
-  previewRef.value.querySelectorAll('.mermaid-deferred').forEach((notice) => notice.remove())
-  decorateCodeBlocks()
-  for (const resource of props.document.resources) await hydrateResource(resource, generation)
-  if (generation !== hydrationGeneration.value) return
-  await hydrateMermaidDiagrams(generation)
-  if (generation !== hydrationGeneration.value) return
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  if (!previewRef.value || generation !== hydrationGeneration.value) return
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  if (!previewRef.value || generation !== hydrationGeneration.value) return
+  const previewArea = previewRef.value.querySelector('.preview-area')
+  const paintKey = `${props.paintOperationId}:${props.documentId}:${props.renderGeneration}`
+  const hasCommittedContent = props.document.html.length === 0 || Boolean(previewArea?.childNodes.length)
+  if (
+    props.active &&
+    props.paintOperationId &&
+    hasCommittedContent &&
+    lastPaintAcknowledgement.value !== paintKey
+  ) {
+    lastPaintAcknowledgement.value = paintKey
+    emit('content-painted', props.paintOperationId, props.documentId, props.renderGeneration)
+  }
   isReady.value = true
   restoreScrollPosition()
   refreshSearchMatches()
+  requestAnimationFrame(() => {
+    void hydrateDeferredContent(generation)
+  })
 }
 
 function openMediaFromTarget(target: Element) {
@@ -492,7 +600,7 @@ function handleShortcut(event: KeyboardEvent) {
   }
 }
 
-watch(() => props.document, () => {
+watch([() => props.document, () => props.paintOperationId, () => props.renderGeneration], () => {
   isReady.value = false
   activeHeadingId.value = props.document.outline[0]?.id ?? ''
   void hydrateContent()
@@ -511,7 +619,9 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  hydrationGeneration.value += 1
   clearMermaidListeners()
+  clearResourceObserver()
   window.removeEventListener('keydown', handleShortcut)
   window.getSelection()?.removeAllRanges()
 })
@@ -530,20 +640,6 @@ onUnmounted(() => {
       @search-next="nextSearchMatch"
       @search-previous="previousSearchMatch"
     />
-    <ReaderSettings
-      :open="props.settingsOpen"
-      :font-scale="fontScale"
-      :content-width="contentWidth"
-      :has-remote-images="remoteImageCount > 0"
-      :remote-image-authorized="props.remoteImageAuthorized"
-      @close="emit('update-settings-open', false)"
-      @decrease-font="fontScale = Math.max(0.85, Number((fontScale - 0.05).toFixed(2)))"
-      @increase-font="fontScale = Math.min(1.35, Number((fontScale + 0.05).toFixed(2)))"
-      @reset-font="fontScale = 1"
-      @toggle-width="contentWidth = contentWidth === 'comfortable' ? 'wide' : 'comfortable'"
-      @authorize-remote-images="emit('authorize-remote-images')"
-    />
-
     <div class="reader-body">
       <aside v-if="isReady && props.document.outline.length > 0" ref="catalog" class="catalog-sidebar" :aria-label="t('outline')">
         <div class="catalog-title">{{ t('outline') }}</div>
@@ -562,8 +658,8 @@ onUnmounted(() => {
       <div ref="preview" class="reading-content" @scroll="handleContentScroll">
         <div
           class="preview-area"
-          :class="{ 'preview-area-wide': contentWidth === 'wide' }"
-          :style="{ fontSize: `${fontScale}rem` }"
+          :class="{ 'preview-area-wide': props.contentWidth === 'wide' }"
+          :style="{ fontSize: `${props.fontScale}rem` }"
           @click="handlePreviewClick"
           @keydown="handlePreviewKeydown"
           v-html="props.document.html"
@@ -624,8 +720,10 @@ onUnmounted(() => {
 .preview-area :deep(.code-toolbar + pre) { margin-top: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
 .preview-area :deep(.code-copy-button), .preview-area :deep(.mermaid-deferred button) { padding: 4px 8px; border: 1px solid var(--border-color); border-radius: 5px; color: var(--text-secondary); background: var(--bg-primary); cursor: pointer; font: inherit; font-size: 11px; }
 .preview-area :deep(.code-copy-button) { display: grid; width: 27px; height: 27px; place-items: center; padding: 0; }
-.preview-area :deep(.code-copy-button svg) { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+.preview-area :deep(.code-copy-actions) { display: inline-flex; align-items: center; gap: 6px; }
+.preview-area :deep(.code-copy-button svg) { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .preview-area :deep(.code-copy-button[data-copied="true"]) { color: #2f9e78; }
+.preview-area :deep(.code-copy-feedback) { display: inline-flex; align-items: center; min-height: 22px; padding: 0 6px; border-radius: 5px; color: #26765d; background: rgba(47, 158, 120, 0.12); font-size: 10px; font-weight: 650; white-space: nowrap; }
 .preview-area :deep(.code-copy-button:hover), .preview-area :deep(.code-copy-button:focus-visible), .preview-area :deep(.mermaid-deferred button:hover), .preview-area :deep(.mermaid-deferred button:focus-visible) { color: var(--text-primary); background: var(--tool-btn-hover-bg); outline: 2px solid rgba(76, 110, 245, 0.24); outline-offset: 1px; }
 .preview-area :deep(pre code) { padding: 0; color: inherit; background: transparent; font-size: 0.86em; }
 .preview-area :deep(table) { display: block; width: 100%; margin: 20px 0; overflow-x: auto; border-collapse: collapse; white-space: nowrap; scrollbar-width: thin; scrollbar-color: transparent transparent; }
