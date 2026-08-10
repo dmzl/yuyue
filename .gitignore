@@ -15,6 +15,14 @@ dist-ssr
 /*.app/
 /*.dmg
 
+# Private product, technical, and verification records stay at their usual
+# local paths but are never published in the public source repository.
+/docs/PROJECT_CONTEXT.md
+/docs/TECH_STACK.md
+/docs/ARCHITECTURE.md
+/docs/features/
+/docs/release/VERIFICATION.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

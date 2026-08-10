@@ -14,8 +14,6 @@ v0.1 完成后将优先提供：
 - 本地图片安全加载，HTTPS 远程图片默认阻断并按当前标签临时授权。
 - MIT License、自动测试、依赖审计、校验和和可追溯 GitHub Release。
 
-完整范围见 [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md) 和 [`docs/features/open-source-v0.1/REQUIREMENTS.md`](docs/features/open-source-v0.1/REQUIREMENTS.md)。
-
 ## 为什么做屿阅
 
 AI 生成的方案、报告、教程和技术文档经常以 Markdown 交付。对熟悉开发工具的人这很方便，但对普通接收者来说，直接打开 `.md` 往往只是带符号的纯文本。屿阅的目标是把“把文档发给别人”变成“对方下载后直接阅读”。
@@ -29,7 +27,7 @@ AI 生成的方案、报告、教程和技术文档经常以 Markdown 交付。�
 - 外部链接只在用户点击后交给系统浏览器。
 - 文档、图片、SVG 和 Mermaid 都有资源上限。
 
-安全模型见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，漏洞报告方式见 [`SECURITY.md`](SECURITY.md)。
+漏洞报告方式见 [`SECURITY.md`](SECURITY.md)。
 
 ## 从源码运行
 
@@ -66,17 +64,15 @@ npm run tauri -- build --bundles app --ci --no-sign
 bash scripts/build-unsigned-dmg.sh
 ```
 
-当前真实技术栈和命令以 [`docs/TECH_STACK.md`](docs/TECH_STACK.md) 为准。
-
 ## 安装包
 
-完成 v0.1 验收后，GitHub Releases workflow 将在维护者推送版本 tag 时提供 unsigned macOS 安装产物、SHA-256 和构建来源。由于不使用 Apple Developer ID 签名或公证，macOS 可能显示 Gatekeeper 提示；Release 说明会提供明确的校验和手动安装步骤。
+完成 v0.1 验收后，GitHub Releases workflow 将在维护者推送版本 tag 时提供 unsigned macOS 安装产物、SHA-256 和构建来源。由于不使用 Apple Developer ID 签名或公证，macOS 可能显示 Gatekeeper 提示；Release 说明会提供明确的校验和手动安装步骤，详见 [`docs/release/UNSIGNED_MACOS.md`](docs/release/UNSIGNED_MACOS.md)。
 
 在首个 Release 出现之前，不存在官方预构建下载。
 
 ## 贡献
 
-请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 和 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。涉及解析、安全、权限、文件访问、Mermaid、SVG 或容量边界的变更，应先核对 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 和 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。
 
 ## License
 

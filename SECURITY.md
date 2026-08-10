@@ -35,4 +35,4 @@
 - Mermaid/SVG 不得绕过网络、脚本、文件或容量边界。
 - 外部链接只能在明确用户点击后由最小权限系统调用打开。
 
-架构级安全边界详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+以上默认值构成本项目的公开安全边界。

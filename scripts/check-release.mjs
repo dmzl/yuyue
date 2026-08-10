@@ -1,5 +1,4 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { createHash } from 'node:crypto'
 import { resolve } from 'node:path'
 
 const root = resolve('.')
@@ -11,7 +10,6 @@ const requiredFiles = [
   'CODE_OF_CONDUCT.md',
   'package-lock.json',
   'src-tauri/Cargo.lock',
-  'docs/release/VERIFICATION.md',
   'docs/release/UNSIGNED_MACOS.md',
   'scripts/build-unsigned-dmg.sh',
   '.github/workflows/ci.yml',
@@ -29,12 +27,6 @@ const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
 for (const phrase of ['unsigned', 'SHA-256', 'Gatekeeper']) {
   if (!readme.includes(phrase)) throw new Error(`README missing release guidance: ${phrase}`)
 }
-const designSource = readFileSync(resolve(root, 'docs/features/open-source-v0.1/TECH_DESIGN.md'), 'utf8')
-const canonicalDesign = designSource.replace(/^Design digest：.*$/m, 'Design digest：`canonical-sha256: <digest>`')
-const designDigest = createHash('sha256').update(canonicalDesign).digest('hex')
-if (!designSource.includes(`canonical-sha256: ${designDigest}`)) throw new Error('TECH_DESIGN canonical digest is stale')
-const implementationSpec = readFileSync(resolve(root, 'docs/features/open-source-v0.1/IMPLEMENTATION_SPEC.md'), 'utf8')
-if (!implementationSpec.includes(`canonical digest \`${designDigest}\``)) throw new Error('IMPLEMENTATION_SPEC source digest is stale')
 const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
 for (const phrase of ['npm ci', 'npm run test:ci', 'npm run audit', 'cargo test --locked']) {
   if (!ciWorkflow.includes(phrase)) throw new Error(`CI workflow missing required check: ${phrase}`)
