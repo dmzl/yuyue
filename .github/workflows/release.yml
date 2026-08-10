@@ -39,24 +39,46 @@ jobs:
         run: npm run tauri -- build --bundles app --ci --no-sign
       - name: Build unsigned macOS DMG without Finder automation
         run: bash scripts/build-unsigned-dmg.sh
+      - name: Prepare portable release asset name
+        working-directory: src-tauri/target/release/bundle/dmg
+        run: |
+          source_dmg="$(find . -maxdepth 1 -type f -name '屿阅_*.dmg' -print -quit)"
+          if [[ -z "$source_dmg" ]]; then
+            echo "Missing unsigned DMG release asset" >&2
+            exit 1
+          fi
+          asset_name="yuyue_${source_dmg#./屿阅_}"
+          cp "$source_dmg" "$asset_name"
       - name: Create SHA-256 checksums
         working-directory: src-tauri/target/release/bundle/dmg
-        run: shasum -a 256 *.dmg > "$GITHUB_WORKSPACE/SHA256SUMS"
+        run: shasum -a 256 yuyue_*.dmg > "$GITHUB_WORKSPACE/SHA256SUMS"
       - name: Verify downloaded-file checksum layout
         working-directory: src-tauri/target/release/bundle/dmg
         run: shasum -a 256 -c "$GITHUB_WORKSPACE/SHA256SUMS"
       - name: Attest unsigned release build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'src-tauri/target/release/bundle/dmg/*.dmg'
+          subject-path: 'src-tauri/target/release/bundle/dmg/yuyue_*.dmg'
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: 屿阅 ${{ github.ref_name }}
           body_path: docs/release/UNSIGNED_MACOS.md
           files: |
-            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/dmg/yuyue_*.dmg
             SHA256SUMS
           generate_release_notes: true
           draft: false
           prerelease: false
+      - name: Remove legacy normalized-name DMGs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/release-assets.txt"
+          while IFS= read -r asset; do
+            case "$asset" in
+              _*.dmg)
+                gh release delete-asset "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+                ;;
+            esac
+          done < "$RUNNER_TEMP/release-assets.txt"
