@@ -1,4 +1,4 @@
-name: CI
+name: CI / 持续集成
 
 on:
   push:
@@ -13,31 +13,31 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - name: Check out source
+      - name: Check out source / 检出源码
         uses: actions/checkout@v4
-      - name: Set up Node.js
+      - name: Set up Node.js / 设置 Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-      - name: Install frontend dependencies deterministically
+      - name: Install frontend dependencies deterministically / 确定性安装前端依赖
         run: npm ci
-      - name: Execute frontend tests
+      - name: Execute frontend tests / 执行前端测试
         run: npm run test:ci
-      - name: Lint frontend and build configuration
+      - name: Lint frontend and build configuration / 检查前端与构建配置
         run: npm run lint
-      - name: Audit dependencies
+      - name: Audit dependencies / 审计依赖
         run: npm run audit
-      - name: Build frontend and renderer assets
+      - name: Build frontend and renderer assets / 构建前端与 renderer 资源
         run: npm run build
-      - name: Check release structure
+      - name: Check release structure / 检查发布结构
         run: node scripts/check-release.mjs
-      - name: Check Rust formatting
+      - name: Check Rust formatting / 检查 Rust 格式
         working-directory: src-tauri
         run: cargo fmt --check
-      - name: Run Rust tests
+      - name: Run Rust tests / 执行 Rust 测试
         working-directory: src-tauri
         run: cargo test --locked
-      - name: Run Rust lint
+      - name: Run Rust lint / 执行 Rust lint
         working-directory: src-tauri
         run: cargo clippy --all-targets -- --deny warnings

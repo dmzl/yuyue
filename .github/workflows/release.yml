@@ -1,4 +1,4 @@
-name: Unsigned macOS Release
+name: Unsigned macOS Release / 未签名 macOS 发布
 
 on:
   push:
@@ -17,29 +17,29 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - name: Check out source
+      - name: Check out source / 检出源码
         uses: actions/checkout@v4
-      - name: Set up Node.js
+      - name: Set up Node.js / 设置 Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-      - name: Install frontend dependencies deterministically
+      - name: Install frontend dependencies deterministically / 确定性安装前端依赖
         run: npm ci
-      - name: Run release quality checks
+      - name: Run release quality checks / 执行发布质量检查
         run: npm run test:ci && npm run lint && npm run audit
-      - name: Build frontend and sandbox renderer
+      - name: Build frontend and sandbox renderer / 构建前端与沙箱 renderer
         run: npm run build
-      - name: Check release structure
+      - name: Check release structure / 检查发布结构
         run: node scripts/check-release.mjs
-      - name: Check and test Rust
+      - name: Check and test Rust / 检查并测试 Rust
         working-directory: src-tauri
         run: cargo fmt --check && cargo test --locked && cargo clippy --all-targets -- --deny warnings
-      - name: Build unsigned macOS app
+      - name: Build unsigned macOS app / 构建未签名 macOS 应用
         run: npm run tauri -- build --bundles app --ci --no-sign
-      - name: Build unsigned macOS DMG without Finder automation
+      - name: Build unsigned macOS DMG without Finder automation / 不使用 Finder 自动化构建未签名 DMG
         run: bash scripts/build-unsigned-dmg.sh
-      - name: Prepare portable release asset name
+      - name: Prepare portable release asset name / 准备可移植发布资产名称
         working-directory: src-tauri/target/release/bundle/dmg
         run: |
           source_dmg="$(find . -maxdepth 1 -type f -name '屿阅_*.dmg' -print -quit)"
@@ -49,20 +49,20 @@ jobs:
           fi
           asset_name="yuyue_${source_dmg#./屿阅_}"
           cp "$source_dmg" "$asset_name"
-      - name: Create SHA-256 checksums
+      - name: Create SHA-256 checksums / 创建 SHA-256 校验和
         working-directory: src-tauri/target/release/bundle/dmg
         run: shasum -a 256 yuyue_*.dmg > "$GITHUB_WORKSPACE/SHA256SUMS"
-      - name: Verify downloaded-file checksum layout
+      - name: Verify downloaded-file checksum layout / 验证下载文件校验布局
         working-directory: src-tauri/target/release/bundle/dmg
         run: shasum -a 256 -c "$GITHUB_WORKSPACE/SHA256SUMS"
-      - name: Attest unsigned release build provenance
+      - name: Attest unsigned release build provenance / 证明未签名发布构建来源
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'src-tauri/target/release/bundle/dmg/yuyue_*.dmg'
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release / 发布 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: 屿阅 ${{ github.ref_name }}
+          name: 屿阅 ${{ github.ref_name }} / Yuyue ${{ github.ref_name }}
           body_path: docs/release/UNSIGNED_MACOS.md
           files: |
             src-tauri/target/release/bundle/dmg/yuyue_*.dmg
@@ -70,7 +70,7 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
-      - name: Remove legacy normalized-name DMGs
+      - name: Remove legacy normalized-name DMGs / 清理旧规范化名称 DMG
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
