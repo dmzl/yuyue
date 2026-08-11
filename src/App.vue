@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { listen } from '@tauri-apps/api/event'
 import { useTheme } from './composables/useTheme'
@@ -455,6 +456,24 @@ function isTauriRuntime() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
 
+function isTitlebarControl(target: unknown) {
+  return target instanceof Element && target.closest(
+    'button, input, select, textarea, a, [role="button"], [role="tab"], [contenteditable]',
+  )
+}
+
+function handleTitlebarMouseDown(event: MouseEvent) {
+  if (event.button !== 0 || isTitlebarControl(event.target) || !isTauriRuntime()) return
+  event.preventDefault()
+  void getCurrentWindow().startDragging().catch(() => {})
+}
+
+function handleTitlebarDoubleClick(event: MouseEvent) {
+  if (event.button !== 0 || isTitlebarControl(event.target) || !isTauriRuntime()) return
+  event.preventDefault()
+  void getCurrentWindow().toggleMaximize().catch(() => {})
+}
+
 function syncNativeMenuLocale() {
   if (!isTauriRuntime()) return
   void invoke('set_menu_locale', { locale: currentLocale.value }).catch(() => {})
@@ -587,7 +606,7 @@ onUnmounted(() => {
 
 <template>
   <div class="app-container">
-    <header class="header-area" data-tauri-drag-region>
+    <header class="header-area" @mousedown="handleTitlebarMouseDown" @dblclick="handleTitlebarDoubleClick">
       <div class="titlebar">
         <div v-if="hasTabs" class="titlebar-tabs">
           <TabBar

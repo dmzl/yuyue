@@ -20,6 +20,15 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(async () => ({ url: 'data:image/png;base64,AA==' })),
 }))
 
+const windowControls = vi.hoisted(() => ({
+  startDragging: vi.fn(async () => undefined),
+  toggleMaximize: vi.fn(async () => undefined),
+}))
+
+vi.mock('@tauri-apps/api/window', () => ({
+  getCurrentWindow: vi.fn(() => windowControls),
+}))
+
 useLocale().setLocale('zh-Hans')
 
 function makeTab(id: string, fileName: string): Tab {
@@ -59,6 +68,49 @@ describe('reader controls', () => {
     const appSource = readFileSync(resolve(process.cwd(), 'src/App.vue'), 'utf8')
     expect(appSource).toContain('margin-left: auto')
     wrapper.unmount()
+  })
+
+  it('keeps native window controls on the compact titlebar', async () => {
+    const appSource = readFileSync(resolve(process.cwd(), 'src/App.vue'), 'utf8')
+    const capabilities = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'src-tauri/capabilities/default.json'), 'utf8'),
+    ) as { permissions: string[] }
+    const originalTauriInternals = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__')
+    const wrapper = mount(App, { attachTo: document.body })
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: {},
+    })
+    windowControls.startDragging.mockClear()
+    windowControls.toggleMaximize.mockClear()
+
+    try {
+      expect(appSource).toContain('@mousedown="handleTitlebarMouseDown"')
+      expect(appSource).toContain('@dblclick="handleTitlebarDoubleClick"')
+      expect(capabilities.permissions).toContain('core:default')
+      expect(capabilities.permissions).toContain('core:window:allow-start-dragging')
+      expect(capabilities.permissions).toContain('core:window:allow-toggle-maximize')
+
+      const header = wrapper.get('.header-area')
+      await header.trigger('mousedown', { button: 0 })
+      await header.trigger('dblclick', { button: 0 })
+      expect(windowControls.startDragging).toHaveBeenCalledTimes(1)
+      expect(windowControls.toggleMaximize).toHaveBeenCalledTimes(1)
+
+      const settingsToggle = wrapper.get('.reader-settings-toggle')
+      await settingsToggle.trigger('mousedown', { button: 0 })
+      await settingsToggle.trigger('dblclick', { button: 0 })
+      expect(windowControls.startDragging).toHaveBeenCalledTimes(1)
+      expect(windowControls.toggleMaximize).toHaveBeenCalledTimes(1)
+    } finally {
+      if (originalTauriInternals) {
+        Object.defineProperty(window, '__TAURI_INTERNALS__', originalTauriInternals)
+      } else {
+        delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+      }
+      wrapper.unmount()
+    }
   })
 
   it('shows a non-blocking truthful import or render phase without a fake percentage', () => {
