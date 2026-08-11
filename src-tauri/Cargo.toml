@@ -34,6 +34,6 @@ fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSPrintInfo", "NSPrintOperation", "NSResponder", "NSWindow"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSAppearance", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSWindow"] }
 objc2-foundation = "0.3.2"
 objc2-web-kit = { version = "0.3.2", features = ["WKWebView"] }

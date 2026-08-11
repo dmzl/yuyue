@@ -22,6 +22,11 @@ use uuid::Uuid;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSCopying, NSString};
 
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+};
+
 const MAX_DOCUMENT_INPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_OPEN_DOCUMENTS: usize = 32;
 const MAX_IMPORT_OPERATIONS: usize = 32;
@@ -2548,6 +2553,36 @@ fn set_menu_locale(app: AppHandle, locale: String) -> Result<(), String> {
     setup_app_menu(&app, &locale).map_err(|_| "MENU_UPDATE_FAILED".to_string())
 }
 
+#[tauri::command]
+fn set_native_window_theme(window: WebviewWindow, theme: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        window
+            .with_webview(move |webview| unsafe {
+                let appearance_name = match theme.as_str() {
+                    "dark" => NSAppearanceNameDarkAqua,
+                    "light" => NSAppearanceNameAqua,
+                    "system" => {
+                        let native_window: &objc2_app_kit::NSWindow = &*webview.ns_window().cast();
+                        native_window.setAppearance(None);
+                        return;
+                    }
+                    _ => return,
+                };
+                let appearance = NSAppearance::appearanceNamed(appearance_name)
+                    .expect("macOS Aqua appearance must be available");
+                let native_window: &objc2_app_kit::NSWindow = &*webview.ns_window().cast();
+                native_window.setAppearance(Some(&appearance));
+            })
+            .map_err(|_| "WINDOW_THEME_UPDATE_FAILED".to_string())?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, theme);
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2604,6 +2639,7 @@ pub fn run() {
             open_document_dialog,
             export_current_pdf,
             set_menu_locale,
+            set_native_window_theme,
             export_png_dialog,
             open_external_url,
             take_pending_import,

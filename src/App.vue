@@ -587,7 +587,7 @@ onUnmounted(() => {
 
 <template>
   <div class="app-container">
-    <header class="header-area">
+    <header class="header-area" data-tauri-drag-region>
       <div class="titlebar">
         <div v-if="hasTabs" class="titlebar-tabs">
           <TabBar
@@ -750,7 +750,7 @@ button, input { font: inherit; }
 <style scoped>
 .app-container { position: relative; display: flex; flex-direction: column; height: 100%; color: var(--text-primary); background: var(--bg-primary); }
 .header-area { flex-shrink: 0; border-bottom: 1px solid var(--titlebar-border); background: var(--titlebar-bg); }
-.titlebar { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 2px 10px 0 14px; }
+.titlebar { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 2px 10px 0 82px; }
 .titlebar-tabs { min-width: 0; flex: 1; align-self: stretch; }
 .titlebar-brand { display: flex; align-items: center; gap: 8px; flex-shrink: 0; color: var(--text-primary); font-size: 13px; font-weight: 700; letter-spacing: -0.01em; }
 .titlebar-brand.compact { display: none; }

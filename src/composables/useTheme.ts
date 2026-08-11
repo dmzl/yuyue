@@ -1,4 +1,5 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef, watchEffect } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { useLocale } from './useLocale'
 
 export type Theme = 'light' | 'dark' | 'system'
@@ -26,6 +27,15 @@ function syncSystemTheme() {
   systemTheme.value = systemMediaQuery?.matches ? 'dark' : 'light'
 }
 
+function syncNativeWindowTheme(theme: Theme) {
+  if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
+  void invoke('set_native_window_theme', { theme })
+    .then(() => {
+      if (theme === 'system') window.requestAnimationFrame(syncSystemTheme)
+    })
+    .catch(() => {})
+}
+
 export function useTheme() {
   function setTheme(theme: Theme) {
     currentTheme.value = theme
@@ -41,7 +51,9 @@ export function useTheme() {
   }
 
   watchEffect(() => {
-    document.documentElement.setAttribute('data-theme', resolvedTheme.value)
+    const theme = resolvedTheme.value
+    document.documentElement.setAttribute('data-theme', theme)
+    syncNativeWindowTheme(currentTheme.value)
   })
 
   onMounted(() => {
