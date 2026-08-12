@@ -36,7 +36,7 @@ describe('RenderDocument markdown pipeline', () => {
       '<script>alert("no")</script>',
     ].join('\n'))
 
-    expect(document.html).toContain('<table>')
+    expect(document.html).toMatch(/<table(?:\s|>)/)
     expect(document.html).toContain('type="checkbox"')
     expect(document.html).toContain('class="katex"')
     expect(document.html).toContain('language-typescript')
@@ -57,6 +57,10 @@ describe('RenderDocument markdown pipeline', () => {
     ])
     expect(document.stats.headingCount).toBe(4)
     expect(document.stats.diagramCount).toBe(1)
+    expect(document.sourceBlocks?.length).toBeGreaterThan(0)
+    const sourceBlockIds = document.sourceBlocks?.map((block) => block.id) ?? []
+    expect(new Set(sourceBlockIds).size).toBe(sourceBlockIds.length)
+    expect(sourceBlockIds.every((id) => new RegExp(`data-md-source-block-id="${id}"`).test(document.html))).toBe(true)
   })
 
   it('keeps external links inert until the desktop shell explicitly opens them', async () => {

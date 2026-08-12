@@ -62,6 +62,19 @@ export interface RenderStats {
   diagramCount: number
 }
 
+export interface RenderSourceBlock {
+  id: string
+  startLine: number
+  endLine: number
+  kind?: 'heading' | 'block'
+}
+
+export interface RenderOptions {
+  renderLeaseId?: string
+  contextEpoch?: number
+  renderGeneration?: number
+}
+
 export interface RenderDocument {
   html: string
   outline: RenderOutlineItem[]
@@ -70,6 +83,11 @@ export interface RenderDocument {
   diagrams: RenderDiagram[]
   diagnostics: RenderDiagnostic[]
   stats: RenderStats
+  /** Present on every Worker-produced document; optional here keeps existing reader fixtures concise. */
+  sourceBlocks?: RenderSourceBlock[]
+  renderLeaseId?: string
+  contextEpoch?: number
+  renderGeneration?: number
 }
 
 type MutableNode = {
@@ -93,6 +111,11 @@ type RenderContext = {
   diagnostics: RenderDiagnostic[]
   usedHeadingIds: Map<string, number>
   mermaidSourceBytes: number
+  sourceBlocks: RenderSourceBlock[]
+  sourceBlockIds: Set<string>
+  sourceBlockHash: string
+  totalSourceLines: number
+  nextSourceBlockSequence: number
 }
 
 const sanitizeSchema = {
@@ -111,6 +134,7 @@ const sanitizeSchema = {
       'data-md-resource-id',
       'data-md-link-id',
       'data-md-diagram-id',
+      'data-md-source-block-id',
       'data-alert-kind',
     ],
     a: [
@@ -139,6 +163,25 @@ const sanitizeSchema = {
 function emptyStats(inputBytes: number): RenderStats {
   return { inputBytes, astNodes: 0, headingCount: 0, diagramCount: 0 }
 }
+
+function stableSourceHash(source: string) {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+function sourceLineCount(source: string) {
+  return source.length === 0 ? 1 : source.split(/\r\n|\r|\n/).length
+}
+
+function defaultRenderLeaseId(sourceHash: string, sequence: number) {
+  return `lease-${sourceHash}-${sequence}`
+}
+
+let renderLeaseSequence = 0
 
 function diagnostic(
   code: string,
@@ -192,6 +235,41 @@ function positionOf(node: MutableNode): { start: number; end: number } | undefin
   return { start, end }
 }
 
+function sourceBlockPosition(node: MutableNode, context: RenderContext) {
+  const position = positionOf(node)
+  if (!position) return undefined
+  const startLine = Math.max(1, Math.min(position.start, context.totalSourceLines))
+  const endLine = Math.max(startLine, Math.min(position.end, context.totalSourceLines))
+  return { startLine, endLine }
+}
+
+function assignSourceBlock(node: MutableNode, context: RenderContext) {
+  if (node.data?.sourceBlockId) return
+  const position = sourceBlockPosition(node, context)
+  if (!position) return
+  const sequence = ++context.nextSourceBlockSequence
+  const id = `sb-${context.sourceBlockHash}-${sequence}`
+  node.data = {
+    ...node.data,
+    sourceBlockId: id,
+    hProperties: {
+      ...((node.data?.hProperties as Record<string, unknown>) ?? {}),
+      'data-md-source-block-id': id,
+    },
+  }
+  context.sourceBlocks.push({ id, ...position, kind: node.type === 'heading' ? 'heading' : 'block' })
+  context.sourceBlockIds.add(id)
+}
+
+function isSourceBlockNode(node: MutableNode, parent?: MutableNode) {
+  if (node.type === 'heading' || node.type === 'code' || node.type === 'table'
+    || node.type === 'thematicBreak' || node.type === 'math') return true
+  if (node.type === 'listItem') return true
+  // A list item's own DOM element is the source target; avoid putting a
+  // second target on its immediate paragraph child.
+  return node.type === 'paragraph' && parent?.type !== 'listItem'
+}
+
 function makeElement(
   tagName: string,
   properties: Record<string, unknown>,
@@ -201,7 +279,7 @@ function makeElement(
 }
 
 function transformMarkdownTree(tree: MutableNode, context: RenderContext) {
-  visit(tree as any, (node: MutableNode) => {
+  visit(tree as any, (node: MutableNode, _index: number | undefined, parent: MutableNode | undefined) => {
     if (node.type === 'html') {
       // Raw HTML is rendered as literal text before mdast is converted to hast.
       node.type = 'text'
@@ -217,6 +295,8 @@ function transformMarkdownTree(tree: MutableNode, context: RenderContext) {
       }
       context.outline.push({ id, level: node.depth, text, sourcePosition: positionOf(node) })
     }
+
+    if (isSourceBlockNode(node, parent)) assignSourceBlock(node, context)
 
     if (node.type === 'image') {
       const source = node.url ?? ''
@@ -316,6 +396,7 @@ function createHandlers() {
         {
           className: ['mermaid-placeholder', ...(node.data?.diagramError ? ['mermaid-error'] : [])],
           'data-md-diagram-id': String(node.data?.diagramId ?? ''),
+          ...(node.data?.sourceBlockId ? { 'data-md-source-block-id': String(node.data.sourceBlockId) } : {}),
           role: 'img',
           'aria-label': 'Mermaid 图表',
         },
@@ -324,8 +405,56 @@ function createHandlers() {
   }
 }
 
-export async function renderMarkdown(source: string): Promise<RenderDocument> {
+function sourceBlockIdFromProperties(properties: Record<string, unknown> | undefined) {
+  const value = properties?.['data-md-source-block-id'] ?? properties?.dataMdSourceBlockId
+  return typeof value === 'string' ? value : undefined
+}
+
+function validateSourceBlockDom(tree: unknown, context: RenderContext) {
+  const observed = new Set<string>()
+  let valid = true
+  visit(tree as any, 'element', (node: any) => {
+    const id = sourceBlockIdFromProperties(node.properties)
+    if (!id) return
+    if (!/^sb-[a-f0-9]{8}-[0-9]{1,6}$/.test(id)
+      || !context.sourceBlockIds.has(id)
+      || observed.has(id)) valid = false
+    observed.add(id)
+  })
+  if (!valid || observed.size !== context.sourceBlockIds.size) {
+    throw new Error('RENDER_SOURCE_BLOCK_PROTOCOL')
+  }
+}
+
+function renderResultContext(sourceHash: string, options: RenderOptions) {
+  const contextEpoch = options.contextEpoch ?? 0
+  const renderGeneration = options.renderGeneration ?? 0
+  const renderLeaseId = options.renderLeaseId ?? defaultRenderLeaseId(sourceHash, ++renderLeaseSequence)
+  return { contextEpoch, renderGeneration, renderLeaseId }
+}
+
+function emptyRenderDocument(
+  inputBytes: number,
+  sourceHash: string,
+  options: RenderOptions,
+  diagnostics: RenderDiagnostic[] = [],
+): RenderDocument {
+  return {
+    html: '',
+    outline: [],
+    resources: [],
+    links: [],
+    diagrams: [],
+    diagnostics,
+    stats: emptyStats(inputBytes),
+    sourceBlocks: [],
+    ...renderResultContext(sourceHash, options),
+  }
+}
+
+export async function renderMarkdown(source: string, options: RenderOptions = {}): Promise<RenderDocument> {
   const inputBytes = new TextEncoder().encode(source).byteLength
+  const sourceHash = stableSourceHash(source)
   const context: RenderContext = {
     outline: [],
     resources: [],
@@ -334,18 +463,20 @@ export async function renderMarkdown(source: string): Promise<RenderDocument> {
     diagnostics: [],
     usedHeadingIds: new Map(),
     mermaidSourceBytes: 0,
+    sourceBlocks: [],
+    sourceBlockIds: new Set(),
+    sourceBlockHash: sourceHash,
+    totalSourceLines: sourceLineCount(source),
+    nextSourceBlockSequence: 0,
   }
 
   if (inputBytes > MAX_MARKDOWN_BYTES) {
-    return {
-      html: '',
-      outline: [],
-      resources: [],
-      links: [],
-      diagrams: [],
-      diagnostics: [diagnostic('MARKDOWN_TOO_LARGE', 'Markdown 文件超过 10 MiB 限制')],
-      stats: emptyStats(inputBytes),
-    }
+    return emptyRenderDocument(
+      inputBytes,
+      sourceHash,
+      options,
+      [diagnostic('MARKDOWN_TOO_LARGE', 'Markdown 文件超过 10 MiB 限制')],
+    )
   }
 
   try {
@@ -365,17 +496,18 @@ export async function renderMarkdown(source: string): Promise<RenderDocument> {
       .use(rehypeSanitize, sanitizeSchema)
       .use(rehypeKatex)
       .use(rehypeHighlight)
+      .use(() => (tree: any) => validateSourceBlockDom(tree, context))
       .use(rehypeStringify)
     const tree = processor.parse(source)
     const astNodes = countNodes(tree as MutableNode)
     if (astNodes > MAX_AST_NODES) {
       return {
-        html: '',
-        outline: [],
-        resources: [],
-        links: [],
-        diagrams: [],
-        diagnostics: [diagnostic('MARKDOWN_AST_LIMIT', 'Markdown 结构超过安全限制')],
+        ...emptyRenderDocument(
+          inputBytes,
+          sourceHash,
+          options,
+          [diagnostic('MARKDOWN_AST_LIMIT', 'Markdown 结构超过安全限制')],
+        ),
         stats: {
           inputBytes,
           astNodes,
@@ -400,6 +532,8 @@ export async function renderMarkdown(source: string): Promise<RenderDocument> {
           headingCount: context.outline.length,
           diagramCount: context.diagrams.length,
         },
+        sourceBlocks: context.sourceBlocks,
+        ...renderResultContext(sourceHash, options),
       }
     }
     return {
@@ -415,17 +549,20 @@ export async function renderMarkdown(source: string): Promise<RenderDocument> {
         headingCount: context.outline.length,
         diagramCount: context.diagrams.length,
       },
+      sourceBlocks: context.sourceBlocks,
+      ...renderResultContext(sourceHash, options),
     }
-  } catch {
-    return {
-      html: '',
-      outline: [],
-      resources: [],
-      links: [],
-      diagrams: [],
-      diagnostics: [diagnostic('MARKDOWN_PARSE_FAILED', 'Markdown 无法解析')],
-      stats: emptyStats(inputBytes),
-    }
+  } catch (error) {
+    const protocolFailure = error instanceof Error && error.message === 'RENDER_SOURCE_BLOCK_PROTOCOL'
+    return emptyRenderDocument(
+      inputBytes,
+      sourceHash,
+      options,
+      [diagnostic(
+        protocolFailure ? 'RENDER_PROTOCOL_ERROR' : 'MARKDOWN_PARSE_FAILED',
+        protocolFailure ? 'Markdown 源码映射校验失败' : 'Markdown 无法解析',
+      )],
+    )
   }
 }
 

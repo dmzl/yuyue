@@ -3,7 +3,8 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { mount } from '@vue/test-utils'
 import ReaderSettings from '../src/components/ReaderSettings.vue'
-import { resolveInitialLocale, useLocale } from '../src/composables/useLocale'
+import { LOCALES, resolveInitialLocale, useLocale } from '../src/composables/useLocale'
+import { createCodeMirrorPhrases } from '../src/editor/codeMirrorPhrases'
 
 describe('interface locale', () => {
   afterEach(() => {
@@ -50,5 +51,17 @@ describe('interface locale', () => {
     expect(wrapper.get('span.settings-label').text()).toBe('文字大小')
     expect(localStorage.getItem('mdreader-locale')).toBe('zh-Hant')
     wrapper.unmount()
+  })
+
+  it('provides the complete editor phrase set in every supported language', () => {
+    const locale = useLocale()
+    const expectedFind = { 'zh-Hans': '查找', en: 'Find', 'zh-Hant': '尋找', ja: '検索' }
+    for (const language of LOCALES) {
+      locale.setLocale(language)
+      const phrases = createCodeMirrorPhrases(locale.t)
+      expect(phrases.Find).toBe(expectedFind[language])
+      expect(Object.keys(phrases)).toHaveLength(19)
+      expect(Object.values(phrases).every(Boolean)).toBe(true)
+    }
   })
 })

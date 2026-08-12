@@ -20,7 +20,8 @@ const props = withDefaults(defineProps<{
   fontScale?: number
   contentWidth?: 'comfortable' | 'wide'
   settingsOpen?: boolean
-}>(), { renderGeneration: 0, paintOperationId: '', errorMessage: '', fontScale: 1, contentWidth: 'comfortable', settingsOpen: false })
+  embedded?: boolean
+}>(), { renderGeneration: 0, paintOperationId: '', errorMessage: '', fontScale: 1, contentWidth: 'comfortable', settingsOpen: false, embedded: false })
 
 const emit = defineEmits<{
   'scroll-ratio': [ratio: number]
@@ -28,6 +29,8 @@ const emit = defineEmits<{
   'update-settings-open': [open: boolean]
   'content-painted': [operationId: string, documentId: string, generation: number]
   retry: []
+  'source-block-activate': [blockId: string]
+  'source-block-scroll': [blockId: string]
 }>()
 
 const MERMAID_AUTO_BUDGET_MS = 2_000
@@ -50,7 +53,26 @@ const lastPaintAcknowledgement = shallowRef('')
 const mermaidCleanups: Array<() => void> = []
 type ResourceObserverSession = { disconnect: () => void }
 let resourceObserver: ResourceObserverSession | undefined
+let activeRenderLeaseId = ''
+let contentScrollFrame = 0
+let sourceBlockElements: HTMLElement[] = []
+let sourceBlockElementById = new Map<string, HTMLElement>()
+let outlineHeadingElements: Array<{ id: string, element: HTMLElement }> = []
+let documentElementCacheReady = false
 const { currentLocale, t } = useLocale()
+
+function refreshDocumentElementCaches(container: HTMLElement) {
+  sourceBlockElements = Array.from(container.querySelectorAll<HTMLElement>('[data-md-source-block-id]'))
+  sourceBlockElementById = new Map(sourceBlockElements.flatMap((element) => {
+    const id = element.dataset.mdSourceBlockId
+    return id ? [[id, element] as const] : []
+  }))
+  outlineHeadingElements = props.document.outline.flatMap((item) => {
+    const element = document.getElementById(item.id)
+    return element instanceof HTMLElement ? [{ id: item.id, element }] : []
+  })
+  documentElementCacheReady = true
+}
 
 const diagnosticMessage = computed(() => {
   const first = props.document.diagnostics[0]
@@ -132,17 +154,27 @@ function getScrollRatio() {
 }
 
 function handleContentScroll() {
+  window.cancelAnimationFrame(contentScrollFrame)
+  contentScrollFrame = window.requestAnimationFrame(emitContentScrollState)
+}
+
+function emitContentScrollState() {
   const container = previewRef.value
   if (!container) return
   emit('scroll-ratio', getScrollRatio())
-  const headings = props.document.outline
-    .map((item) => ({ item, element: document.getElementById(item.id) }))
-    .filter((entry): entry is { item: typeof props.document.outline[number]; element: HTMLElement } => entry.element instanceof HTMLElement)
-  let current = headings[0]?.item.id ?? ''
-  for (const heading of headings) {
-    if (heading.element.offsetTop <= container.scrollTop + 72) current = heading.item.id
-    else break
+  let low = 0
+  let high = outlineHeadingElements.length - 1
+  let currentIndex = 0
+  while (low <= high) {
+    const middle = (low + high) >> 1
+    if (outlineHeadingElements[middle].element.offsetTop <= container.scrollTop + 72) {
+      currentIndex = middle
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
   }
+  const current = outlineHeadingElements[currentIndex]?.id ?? ''
   if (current && current !== activeHeadingId.value) {
     activeHeadingId.value = current
     nextTick(() => {
@@ -150,6 +182,66 @@ function handleContentScroll() {
       active?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     })
   }
+  const blockId = sourceBlockNearestViewportTop()
+  if (blockId) emit('source-block-scroll', blockId)
+}
+
+function fallbackHeadingSourceBlockId(target?: Element | null) {
+  const headingBlocks = (props.document.sourceBlocks ?? []).filter((block) => block.kind === 'heading')
+  if (headingBlocks.length === 0) return ''
+  const targetHeadingId = target?.closest<HTMLElement>('h1[id], h2[id], h3[id], h4[id], h5[id], h6[id]')?.id
+  const outlineId = targetHeadingId || activeHeadingId.value
+  const outlineIndex = props.document.outline.findIndex((item) => item.id === outlineId)
+  return headingBlocks[Math.max(outlineIndex, 0)]?.id ?? headingBlocks[0]?.id ?? ''
+}
+
+function sourceBlockNearestViewportTop() {
+  const container = previewRef.value
+  if (!container) return ''
+  if (!documentElementCacheReady) refreshDocumentElementCaches(container)
+  const blocks = sourceBlockElements
+  if (blocks.length === 0) return fallbackHeadingSourceBlockId()
+  const threshold = container.getBoundingClientRect().top + 24
+  let low = 0
+  let high = blocks.length - 1
+  let nearestIndex = 0
+  while (low <= high) {
+    const middle = (low + high) >> 1
+    if (blocks[middle].getBoundingClientRect().top <= threshold) {
+      nearestIndex = middle
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
+  }
+  const nearest = blocks[nearestIndex]
+  return nearest.dataset.mdSourceBlockId ?? fallbackHeadingSourceBlockId(nearest)
+}
+
+function scrollToSourceBlock(blockId: string, behavior: 'auto' | 'smooth' = 'auto') {
+  const container = previewRef.value
+  if (!container || !/^sb-[a-f0-9]{8}-[0-9]{1,6}$/.test(blockId)) return false
+  if (!documentElementCacheReady) refreshDocumentElementCaches(container)
+  let block = sourceBlockElementById.get(blockId) ?? null
+  if (!block) {
+    const sourceBlocks = props.document.sourceBlocks ?? []
+    const target = sourceBlocks.find((candidate) => candidate.id === blockId)
+    const headings = sourceBlocks.filter((candidate) => candidate.kind === 'heading')
+    const precedingHeadings = target
+      ? headings.filter((candidate) => candidate.startLine <= target.startLine)
+      : []
+    const preceding = precedingHeadings[precedingHeadings.length - 1]
+    const fallbackId = preceding?.id ?? fallbackHeadingSourceBlockId()
+    block = fallbackId ? sourceBlockElementById.get(fallbackId) ?? null : null
+    if (!block) {
+      const headingIndex = headings.findIndex((candidate) => candidate.id === fallbackId)
+      const outlineHeading = props.document.outline[Math.max(headingIndex, 0)]
+      block = outlineHeading ? document.getElementById(outlineHeading.id) : null
+    }
+  }
+  if (!block) return false
+  container.scrollTo({ top: Math.max(block.offsetTop - 24, 0), behavior })
+  return true
 }
 
 function scrollToHeading(id: string) {
@@ -304,6 +396,7 @@ async function hydrateResource(resource: RenderResource, generation: number) {
       documentId: props.documentId,
       source: resource.source,
       allowRemote: resource.kind === 'https' && props.remoteImageAuthorized,
+      renderLeaseId: props.document.renderLeaseId ?? 'lease-reader-legacy',
     })
     if (generation !== hydrationGeneration.value) return
     const image = document.createElement('img')
@@ -519,6 +612,7 @@ async function hydrateContent() {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
   if (!previewRef.value || generation !== hydrationGeneration.value) return
   const previewArea = previewRef.value.querySelector('.preview-area')
+  refreshDocumentElementCaches(previewRef.value)
   const paintKey = `${props.paintOperationId}:${props.documentId}:${props.renderGeneration}`
   const hasCommittedContent = props.document.html.length === 0 || Boolean(previewArea?.childNodes.length)
   if (
@@ -531,6 +625,14 @@ async function hydrateContent() {
     emit('content-painted', props.paintOperationId, props.documentId, props.renderGeneration)
   }
   isReady.value = true
+  const nextLease = props.document.renderLeaseId ?? ''
+  if (activeRenderLeaseId && activeRenderLeaseId !== nextLease) {
+    void invoke('release_render_lease', {
+      documentId: props.documentId,
+      renderLeaseId: activeRenderLeaseId,
+    }).catch(() => {})
+  }
+  activeRenderLeaseId = nextLease
   restoreScrollPosition()
   refreshSearchMatches()
   requestAnimationFrame(() => {
@@ -564,6 +666,15 @@ function handlePreviewClick(event: MouseEvent) {
     return
   }
   openMediaFromTarget(target)
+}
+
+function handlePreviewDoubleClick(event: MouseEvent) {
+  if (!props.embedded) return
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const block = target.closest<HTMLElement>('[data-md-source-block-id]')
+  const blockId = block?.dataset.mdSourceBlockId ?? fallbackHeadingSourceBlockId(target)
+  if (blockId) emit('source-block-activate', blockId)
 }
 
 function handlePreviewKeydown(event: KeyboardEvent) {
@@ -602,6 +713,7 @@ function handleShortcut(event: KeyboardEvent) {
 
 watch([() => props.document, () => props.paintOperationId, () => props.renderGeneration], () => {
   isReady.value = false
+  documentElementCacheReady = false
   activeHeadingId.value = props.document.outline[0]?.id ?? ''
   void hydrateContent()
 })
@@ -609,6 +721,7 @@ watch([() => props.document, () => props.paintOperationId, () => props.renderGen
 watch(() => props.remoteImageAuthorized, () => void hydrateContent())
 watch(currentLocale, () => {
   if (!previewRef.value) return
+  documentElementCacheReady = false
   previewRef.value.innerHTML = props.document.html
   void hydrateContent()
 })
@@ -619,16 +732,29 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.cancelAnimationFrame(contentScrollFrame)
   hydrationGeneration.value += 1
   clearMermaidListeners()
   clearResourceObserver()
+  sourceBlockElements = []
+  sourceBlockElementById.clear()
+  outlineHeadingElements = []
+  documentElementCacheReady = false
   window.removeEventListener('keydown', handleShortcut)
   window.getSelection()?.removeAllRanges()
+  if (activeRenderLeaseId) {
+    void invoke('release_render_lease', {
+      documentId: props.documentId,
+      renderLeaseId: activeRenderLeaseId,
+    }).catch(() => {})
+  }
 })
+
+defineExpose({ scrollToHeading, scrollToSourceBlock })
 </script>
 
 <template>
-  <div class="reading-mode">
+  <div class="reading-mode" :class="{ 'reading-mode-embedded': props.embedded }">
     <ReaderSearch
       ref="readerSearch"
       :open="searchOpen"
@@ -641,7 +767,7 @@ onUnmounted(() => {
       @search-previous="previousSearchMatch"
     />
     <div class="reader-body">
-      <aside v-if="isReady && props.document.outline.length > 0" ref="catalog" class="catalog-sidebar" :aria-label="t('outline')">
+      <aside v-if="!props.embedded && isReady && props.document.outline.length > 0" ref="catalog" class="catalog-sidebar" :aria-label="t('outline')">
         <div class="catalog-title">{{ t('outline') }}</div>
         <nav class="catalog-list" :aria-label="t('headingNavigation')">
           <button
@@ -661,6 +787,7 @@ onUnmounted(() => {
           :class="{ 'preview-area-wide': props.contentWidth === 'wide' }"
           :style="{ fontSize: `${props.fontScale}rem` }"
           @click="handlePreviewClick"
+          @dblclick="handlePreviewDoubleClick"
           @keydown="handlePreviewKeydown"
           v-html="props.document.html"
         ></div>
@@ -679,6 +806,9 @@ onUnmounted(() => {
 
 <style scoped>
 .reading-mode { position: relative; display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--bg-primary); }
+.reading-mode-embedded .reading-content { padding: 22px 28px 48px; }
+.reading-mode-embedded .preview-area :deep([data-md-source-block-id]) { border-radius: 5px; }
+.reading-mode-embedded .preview-area :deep([data-md-source-block-id]:hover) { background: color-mix(in srgb, var(--tool-btn-hover-bg) 52%, transparent); }
 .reader-body { display: flex; flex: 1; min-height: 0; }
 .reading-content { min-width: 0; flex: 1; overflow-y: auto; padding: 28px 40px 48px; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: transparent transparent; }
 .reading-content:hover, .reading-content:focus-within { scrollbar-color: rgba(118, 126, 141, 0.42) transparent; }

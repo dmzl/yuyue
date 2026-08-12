@@ -37,6 +37,10 @@ function renderedDocument(overrides: Partial<RenderDocument> = {}): RenderDocume
     diagrams: [],
     diagnostics: [],
     stats: { inputBytes: 1, astNodes: 1, headingCount: 0, diagramCount: 0 },
+    sourceBlocks: [],
+    renderLeaseId: 'lease-test-1',
+    contextEpoch: 0,
+    renderGeneration: 0,
     ...overrides,
   }
 }
@@ -110,6 +114,47 @@ describe('RenderWorkerSupervisor', () => {
       documentKey: 'document-invalid-size',
       document: renderedDocument({ html: '<h1>invalid</h1>' }),
       serializedBytes: Number.NaN,
+    })
+
+    await expect(pending).rejects.toMatchObject({ code: 'RENDER_PROTOCOL_ERROR' })
+    supervisor.dispose()
+  })
+
+  it('accepts source block bounds across mixed Markdown newline styles', async () => {
+    const worker = new FakeWorker()
+    const supervisor = new RenderWorkerSupervisor(() => worker as unknown as Worker)
+    const pending = supervisor.render('# one\r\ntwo\rthree\nfour', 'document-mixed-newlines')
+    const document = renderedDocument({
+      html: '<p data-md-source-block-id="sb-deadbeef-1">four</p>',
+      sourceBlocks: [{ id: 'sb-deadbeef-1', kind: 'block', startLine: 1, endLine: 4 }],
+    })
+
+    worker.respond({
+      type: 'rendered',
+      requestId: worker.sent[0]?.requestId,
+      documentKey: 'document-mixed-newlines',
+      document,
+      serializedBytes: 128,
+    })
+
+    await expect(pending).resolves.toEqual({ document, serializedBytes: 128 })
+    supervisor.dispose()
+  })
+
+  it('rejects duplicate source block ids in rendered HTML', async () => {
+    const worker = new FakeWorker()
+    const supervisor = new RenderWorkerSupervisor(() => worker as unknown as Worker)
+    const pending = supervisor.render('# duplicate', 'document-duplicate-dom-id')
+
+    worker.respond({
+      type: 'rendered',
+      requestId: worker.sent[0]?.requestId,
+      documentKey: 'document-duplicate-dom-id',
+      document: renderedDocument({
+        html: '<p data-md-source-block-id="sb-deadbeef-1">a</p><p data-md-source-block-id="sb-deadbeef-1">b</p>',
+        sourceBlocks: [{ id: 'sb-deadbeef-1', kind: 'block', startLine: 1, endLine: 1 }],
+      }),
+      serializedBytes: 128,
     })
 
     await expect(pending).rejects.toMatchObject({ code: 'RENDER_PROTOCOL_ERROR' })

@@ -9,6 +9,7 @@ export interface Tab {
   documentId: string
   fileName: string
   sourceRevision: number
+  mode?: 'reading' | 'editing'
   document: RenderDocument | null
   sourceContent: string | null
   sourceBytes: number
@@ -18,6 +19,7 @@ export interface Tab {
   renderGeneration: number
   paintOperationId?: string
   scrollRatio: number
+  sourceBlockId?: string
   remoteImageAuthorized: boolean
   error?: string
 }

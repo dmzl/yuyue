@@ -6,9 +6,9 @@ Yuyue is a privacy-first desktop Markdown reader for the situation where AI gene
 
 ## 当前状态 / Current status
 
-当前版本为 v1.0.0。源码、测试、依赖审计、unsigned macOS Release workflow、校验和与构建来源证明均已就绪；GitHub Releases 已提供可安装的 macOS 包。
+当前源码版本为 v1.1.0。源码、测试、依赖审计、unsigned macOS Release workflow、校验和与构建来源证明均已就绪；GitHub Releases 当前提供 v1.0.0 macOS 安装包。
 
-The current version is v1.0.0. The source, tests, dependency audit, unsigned macOS release workflow, checksum, and build provenance are ready, and GitHub Releases provides an installable macOS package.
+The current source version is v1.1.0. The source, tests, dependency audit, unsigned macOS release workflow, checksum, and build provenance are ready; GitHub Releases currently provides the v1.0.0 macOS installer.
 
 v1.0 提供：
 

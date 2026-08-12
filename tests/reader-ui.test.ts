@@ -11,6 +11,7 @@ import MediaLightbox from '../src/components/MediaLightbox.vue'
 import ReaderSearch from '../src/components/ReaderSearch.vue'
 import ReaderSettings from '../src/components/ReaderSettings.vue'
 import ReadingMode from '../src/components/ReadingMode.vue'
+import TitlebarEditAction from '../src/components/TitlebarEditAction.vue'
 import DocumentProcessingNotice from '../src/components/DocumentProcessingNotice.vue'
 import TabBar, { type Tab } from '../src/components/TabBar.vue'
 import { useLocale } from '../src/composables/useLocale'
@@ -50,6 +51,21 @@ function makeTab(id: string, fileName: string): Tab {
 }
 
 describe('reader controls', () => {
+  it('keeps an explicit edit action in the compact titlebar and turns it into completion in edit mode', async () => {
+    const wrapper = mount(TitlebarEditAction, {
+      props: { mode: 'reading', editLabel: '编辑', doneLabel: '完成' },
+    })
+
+    const action = wrapper.get('[data-edit-document]')
+    expect(action.attributes('type')).toBe('button')
+    expect(action.attributes('aria-label')).toBe('编辑')
+    await action.trigger('click')
+    expect(wrapper.emitted('activate')).toEqual([[]])
+    await wrapper.setProps({ mode: 'editing' })
+    expect(wrapper.get('[data-edit-document]').text()).toBe('完成')
+    wrapper.unmount()
+  })
+
   it('keeps settings reachable from the empty state and reserves the right side for app actions', async () => {
     const wrapper = mount(App, { attachTo: document.body })
 
@@ -111,6 +127,18 @@ describe('reader controls', () => {
       }
       wrapper.unmount()
     }
+  })
+
+  it('routes the native close control through the guarded application-exit handshake', () => {
+    const appSource = readFileSync(resolve(process.cwd(), 'src/App.vue'), 'utf8')
+    const closeHandler = appSource.slice(
+      appSource.indexOf('async function handleWindowCloseRequested'),
+      appSource.indexOf('async function handleAppExitRequested'),
+    )
+
+    expect(closeHandler).toContain('await requestGuardedAppExit()')
+    expect(closeHandler).not.toContain('getCurrentWindow().close()')
+    expect(appSource).toContain("invoke<{ attemptId: string }>('confirm_app_exit')")
   })
 
   it('shows a non-blocking truthful import or render phase without a fake percentage', () => {
@@ -640,6 +668,42 @@ describe('media lightbox focus management', () => {
     expect(wrapper.get('[role="alert"]').text()).toContain('文档渲染失败')
     await wrapper.get('button[aria-label="重试此文档"]').trigger('click')
     expect(wrapper.emitted('retry')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('falls back to the nearest heading when a preview source-block marker is unavailable', async () => {
+    const wrapper = mount(ReadingMode, {
+      attachTo: document.body,
+      props: {
+        document: {
+          html: '<h1 id="heading-a">Heading</h1><p>Body without a source marker</p>',
+          outline: [{ id: 'heading-a', text: 'Heading', level: 1 }],
+          resources: [],
+          links: [],
+          diagrams: [],
+          diagnostics: [],
+          sourceBlocks: [
+            { id: 'sb-aaaaaaaa-1', startLine: 1, endLine: 1, kind: 'heading' },
+            { id: 'sb-bbbbbbbb-2', startLine: 2, endLine: 2, kind: 'block' },
+          ],
+          stats: { inputBytes: 32, astNodes: 2, headingCount: 1, diagramCount: 0 },
+        },
+        title: 'document.md',
+        documentId: 'document-fallback',
+        active: true,
+        initialScrollRatio: 0,
+        remoteImageAuthorized: false,
+        embedded: true,
+      },
+    })
+    const preview = wrapper.get('.reading-content').element as HTMLElement
+    preview.scrollTo = vi.fn()
+
+    expect((wrapper.vm as unknown as { scrollToSourceBlock: (id: string) => boolean })
+      .scrollToSourceBlock('sb-bbbbbbbb-2')).toBe(true)
+    expect(preview.scrollTo).toHaveBeenCalled()
+    await wrapper.get('p').trigger('dblclick')
+    expect(wrapper.emitted('source-block-activate')).toEqual([['sb-aaaaaaaa-1']])
     wrapper.unmount()
   })
 })

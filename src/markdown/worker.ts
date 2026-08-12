@@ -5,6 +5,9 @@ type RenderRequest = {
   requestId: string
   documentKey: string
   source: string
+  renderLeaseId?: string
+  contextEpoch?: number
+  renderGeneration?: number
 }
 
 type RenderResponse =
@@ -32,7 +35,11 @@ workerScope.onmessage = async ({ data }) => {
   if (data.type !== 'render') return
   latestRequestByDocument.set(data.documentKey, data.requestId)
   try {
-    const document = await renderMarkdown(data.source)
+    const document = await renderMarkdown(data.source, {
+      renderLeaseId: data.renderLeaseId,
+      contextEpoch: data.contextEpoch,
+      renderGeneration: data.renderGeneration,
+    })
     if (latestRequestByDocument.get(data.documentKey) !== data.requestId) {
       postStaleResponse(data.requestId, data.documentKey)
       return

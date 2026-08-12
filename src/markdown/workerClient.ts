@@ -1,4 +1,4 @@
-import type { RenderDocument } from './renderer'
+import type { RenderDocument, RenderOptions } from './renderer'
 import RenderWorker from './worker?worker'
 
 type RenderResponse =
@@ -16,6 +16,7 @@ type PendingRender = {
   sourceBytes: number
   priority: number
   sequence: number
+  options: RenderOptions
   resolve: (result: RenderResult) => void
   reject: (error: RenderWorkerError) => void
 }
@@ -48,7 +49,21 @@ function isSourcePosition(value: unknown) {
   return isNonNegativeSafeInteger(start) && isNonNegativeSafeInteger(end) && start <= end
 }
 
-function isRenderDocument(value: unknown): value is RenderDocument {
+function lineCount(source: string) {
+  let lines = 1
+  for (let index = 0; index < source.length; index += 1) {
+    const code = source.charCodeAt(index)
+    if (code === 10) {
+      lines += 1
+    } else if (code === 13) {
+      lines += 1
+      if (source.charCodeAt(index + 1) === 10) index += 1
+    }
+  }
+  return lines
+}
+
+function isRenderDocument(value: unknown, pending?: PendingRender): value is RenderDocument {
   if (!isRecord(value) ||
     !isBoundedString(value.html) ||
     !isBoundedArray(value.outline) ||
@@ -56,6 +71,10 @@ function isRenderDocument(value: unknown): value is RenderDocument {
     !isBoundedArray(value.links) ||
     !isBoundedArray(value.diagrams) ||
     !isBoundedArray(value.diagnostics) ||
+    !isBoundedArray(value.sourceBlocks) ||
+    !isBoundedString(value.renderLeaseId) ||
+    !isNonNegativeSafeInteger(value.contextEpoch) ||
+    !isNonNegativeSafeInteger(value.renderGeneration) ||
     !isRecord(value.stats)) return false
 
   const outlineValid = value.outline.every((item) => {
@@ -93,7 +112,40 @@ function isRenderDocument(value: unknown): value is RenderDocument {
     stats.headingCount === value.outline.length &&
     stats.diagramCount === value.diagrams.length
 
-  return outlineValid && resourcesValid && linksValid && diagramsValid && diagnosticsValid && statsValid
+  const totalSourceLines = pending ? lineCount(pending.source) : Number.MAX_SAFE_INTEGER
+  const sourceBlockIds = new Set<string>()
+  const sourceBlocksValid = value.sourceBlocks.every((item) => {
+    if (!isRecord(item) || typeof item.id !== 'string' || !/^sb-[a-f0-9]{8}-[0-9]{1,6}$/.test(item.id)) return false
+    if (item.kind !== undefined && item.kind !== 'heading' && item.kind !== 'block') return false
+    if (!isNonNegativeSafeInteger(item.startLine) || item.startLine < 1
+      || !isNonNegativeSafeInteger(item.endLine) || item.endLine < item.startLine
+      || item.endLine > totalSourceLines || sourceBlockIds.has(item.id)) return false
+    sourceBlockIds.add(item.id)
+    return true
+  })
+  const domSet = new Set<string>()
+  const sourceBlockPattern = /\sdata-md-source-block-id="([^"]+)"/g
+  let sourceBlockDomValid = true
+  let domMatch: RegExpExecArray | null
+  while ((domMatch = sourceBlockPattern.exec(value.html)) !== null) {
+    const id = domMatch[1]
+    if (domSet.has(id)) {
+      sourceBlockDomValid = false
+      break
+    }
+    domSet.add(id)
+  }
+  sourceBlockDomValid = sourceBlockDomValid
+    && domSet.size === sourceBlockIds.size
+    && [...domSet].every((id) => sourceBlockIds.has(id))
+
+  const renderContextValid = /^lease-[a-z0-9-]{1,120}$/i.test(value.renderLeaseId)
+    && (!pending || pending.options.contextEpoch === undefined || value.contextEpoch === pending.options.contextEpoch)
+    && (!pending || pending.options.renderGeneration === undefined || value.renderGeneration === pending.options.renderGeneration)
+    && (!pending || pending.options.renderLeaseId === undefined || value.renderLeaseId === pending.options.renderLeaseId)
+
+  return outlineValid && resourcesValid && linksValid && diagramsValid && diagnosticsValid
+    && statsValid && sourceBlocksValid && sourceBlockDomValid && renderContextValid
 }
 
 function isRenderResponse(value: unknown): value is RenderResponse {
@@ -138,7 +190,7 @@ export class RenderWorkerSupervisor {
     }
   }
 
-  render(source: string, documentKey: string, priority = 0): Promise<RenderResult> {
+  render(source: string, documentKey: string, priority = 0, options: RenderOptions = {}): Promise<RenderResult> {
     const sourceBytes = new TextEncoder().encode(source).byteLength
     const previousRequestId = this.latestByDocument.get(documentKey)
     const previous = previousRequestId ? this.pending.get(previousRequestId) : undefined
@@ -169,6 +221,7 @@ export class RenderWorkerSupervisor {
         sourceBytes,
         priority,
         sequence: this.sequence,
+        options,
         resolve,
         reject,
       })
@@ -223,7 +276,7 @@ export class RenderWorkerSupervisor {
       }
       let rendered: RenderResult | undefined
       if (response.type === 'rendered') {
-        if (!isNonNegativeSafeInteger(response.serializedBytes) || !isRenderDocument(response.document)) {
+        if (!isNonNegativeSafeInteger(response.serializedBytes) || !isRenderDocument(response.document, pending)) {
           this.rejectPending(response.requestId, new RenderWorkerError('RENDER_PROTOCOL_ERROR'))
           if (this.inFlight === response.requestId) this.inFlight = null
           this.restartWorker()
@@ -328,6 +381,7 @@ export class RenderWorkerSupervisor {
         requestId,
         documentKey: selected.documentKey,
         source: selected.source,
+        ...selected.options,
       })
       this.armExecutionTimeout(requestId)
     } catch {
