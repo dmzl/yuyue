@@ -1,8 +1,8 @@
 # 参与贡献 屿阅 / Contributing to Yuyue
 
-感谢你帮助改进屿阅。项目当前已发布 v1.0.0；提交前请先确认改动没有扩大既定产品和安全边界。
+感谢你帮助改进屿阅。项目当前已发布 v1.1.0；提交前请先确认改动没有扩大既定产品和安全边界。
 
-Thank you for helping improve Yuyue. The project has released v1.0.0; before submitting a change, make sure it does not expand the established product or security boundaries.
+Thank you for helping improve Yuyue. The project has released v1.1.0; before submitting a change, make sure it does not expand the established product or security boundaries.
 
 ## 开始之前 / Before you start
 

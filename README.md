@@ -6,9 +6,9 @@ Yuyue is a privacy-first desktop Markdown reader for the situation where AI gene
 
 ## 当前状态 / Current status
 
-当前源码版本为 v1.1.0。源码、测试、依赖审计、unsigned macOS Release workflow、校验和与构建来源证明均已就绪；GitHub Releases 当前提供 v1.0.0 macOS 安装包。
+当前公开版本为 v1.1.0。源码、测试、依赖审计、unsigned macOS Release workflow、校验和与构建来源证明均已就绪；GitHub Releases 提供 unsigned macOS 安装包。
 
-The current source version is v1.1.0. The source, tests, dependency audit, unsigned macOS release workflow, checksum, and build provenance are ready; GitHub Releases currently provides the v1.0.0 macOS installer.
+The current public version is v1.1.0. The source, tests, dependency audit, unsigned macOS release workflow, checksums, and build provenance are ready; GitHub Releases provides the unsigned macOS installer.
 
 v1.0 阅读基线提供：
 
@@ -128,9 +128,9 @@ GitHub Releases workflow 会在推送 `v1.1.0` 这类版本标签时提供 unsig
 
 When a version tag such as `v1.1.0` is pushed, the GitHub Releases workflow publishes an unsigned macOS installer, SHA-256 checksums, and build provenance. Because the build is not signed or notarized with an Apple Developer ID, macOS may show a Gatekeeper warning; the release notes provide checksum and manual-install steps in [`docs/release/UNSIGNED_MACOS.md`](docs/release/UNSIGNED_MACOS.md).
 
-当前公开版本：[`v1.0.0 Release`](https://github.com/dmzl/yuyue/releases/tag/v1.0.0)。
+当前公开版本：[`v1.1.0 Release`](https://github.com/dmzl/yuyue/releases/tag/v1.1.0)。
 
-Current public release: [`v1.0.0 Release`](https://github.com/dmzl/yuyue/releases/tag/v1.0.0).
+Current public release: [`v1.1.0 Release`](https://github.com/dmzl/yuyue/releases/tag/v1.1.0).
 
 v1.1.0 另生成了一个仅供测试的 Windows x64 NSIS 安装包。该包通过 Tauri 官方实验性交叉编译路径生成，未签名，尚未在 Windows 真机运行验收；Windows 编辑写回不属于当前支持范围，测试包也不会上传到 GitHub Release。
 

@@ -2,9 +2,9 @@
 
 ## 支持版本 / Supported versions
 
-目前支持 v1.0.0 公开版本以及默认分支上的最新代码。安全修复会优先针对仍受支持的版本发布。
+目前支持 v1.1.0 公开版本以及默认分支上的最新代码。安全修复会优先针对仍受支持的版本发布。
 
-The supported versions are the public v1.0.0 release and the latest code on the default branch. Security fixes are prioritized for versions that are still supported.
+The supported versions are the public v1.1.0 release and the latest code on the default branch. Security fixes are prioritized for versions that are still supported.
 
 ## 私密报告漏洞 / Report a vulnerability privately
 
